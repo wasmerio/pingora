@@ -27,7 +27,10 @@ pingora-error = { version = "0.6.0", path = "../pingora-error" }
 pingora-timeout = { version = "0.6.0", path = "../pingora-timeout" }
 pingora-http = { version = "0.6.0", path = "../pingora-http" }
 pingora-rustls = { version = "0.6.0", path = "../pingora-rustls", optional = true }
+pingora-s2n = { version = "0.6.0", path = "../pingora-s2n", optional = true }
+bstr = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
+tokio-stream = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }
 httparse = { workspace = true }
@@ -68,6 +71,7 @@ zstd = "0"
 httpdate = "1"
 x509-parser = { version = "0.16.0", optional = true }
 ouroboros = { version = "0.18.4", optional = true }
+lru = { version = "0.16.0", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
@@ -85,6 +89,7 @@ reqwest = { version = "0.11", features = [
 ], default-features = false }
 hyper = "0.14"
 rstest = "0.23.0"
+rustls = "0.23"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
@@ -95,6 +100,7 @@ default = []
 openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
+s2n = ["pingora-s2n", "any_tls", "dep:x509-parser", "ouroboros", "lru"]
 patched_http1 = ["pingora-http/patched_http1"]
 openssl_derived = ["any_tls"]
 any_tls = []

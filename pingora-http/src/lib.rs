@@ -30,7 +30,7 @@ use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
 use pingora_error::{ErrorType::*, OrErr, Result};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 pub use http::method::Method;
 pub use http::status::StatusCode;
@@ -55,6 +55,11 @@ same order of the map of header values.
 This idea is inspaired by hyper @nox
 */
 type CaseMap = HMap<CaseHeaderName>;
+
+pub enum HeaderNameVariant<'a> {
+    Case(&'a CaseHeaderName),
+    Titled(&'a str),
+}
 
 /// The HTTP request header type.
 ///
@@ -84,6 +89,12 @@ impl Deref for RequestHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
+    }
+}
+
+impl DerefMut for RequestHeader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
     }
 }
 
@@ -185,6 +196,46 @@ impl RequestHeader {
     /// The header case will be preserved.
     pub fn header_to_h1_wire(&self, buf: &mut impl BufMut) {
         header_to_h1_wire(self.header_name_map.as_ref(), &self.base.headers, buf)
+    }
+
+    /// If case sensitivity is enabled, returns an iterator to iterate over case-sensitive header names and values.
+    /// Otherwise returns an empty iterator.
+    ///
+    /// Headers of the same name are visited in insertion order.
+    pub fn case_header_iter(&self) -> impl Iterator<Item = (&CaseHeaderName, &HeaderValue)> + '_ {
+        case_header_iter(self.header_name_map.as_ref(), &self.base.headers)
+    }
+
+    /// Returns true if the request has case-sensitive headers.
+    pub fn has_case(&self) -> bool {
+        self.header_name_map.is_some()
+    }
+
+    pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
+        &self,
+        mut f: F,
+    ) -> Result<()> {
+        let key_map = self.header_name_map.as_ref();
+        let value_map = &self.base.headers;
+
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
+                f(HeaderNameVariant::Case(case_header), val)?;
+            }
+        } else {
+            for (header, value) in value_map {
+                let titled_header =
+                    case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
+                f(HeaderNameVariant::Titled(titled_header), value)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Set the request method
@@ -336,6 +387,12 @@ impl Deref for ResponseHeader {
     }
 }
 
+impl DerefMut for ResponseHeader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
+    }
+}
+
 impl Clone for ResponseHeader {
     fn clone(&self) -> Self {
         Self {
@@ -465,6 +522,46 @@ impl ResponseHeader {
         header_to_h1_wire(self.header_name_map.as_ref(), &self.base.headers, buf)
     }
 
+    /// If case sensitivity is enabled, returns an iterator to iterate over case-sensitive header names and values.
+    /// Otherwise returns an empty iterator.
+    ///
+    /// Headers of the same name are visited in insertion order.
+    pub fn case_header_iter(&self) -> impl Iterator<Item = (&CaseHeaderName, &HeaderValue)> + '_ {
+        case_header_iter(self.header_name_map.as_ref(), &self.base.headers)
+    }
+
+    /// Returns true if the response has case-sensitive headers.
+    pub fn has_case(&self) -> bool {
+        self.header_name_map.is_some()
+    }
+
+    pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
+        &self,
+        mut f: F,
+    ) -> Result<()> {
+        let key_map = self.header_name_map.as_ref();
+        let value_map = &self.base.headers;
+
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
+                f(HeaderNameVariant::Case(case_header), val)?;
+            }
+        } else {
+            for (header, value) in value_map {
+                let titled_header =
+                    case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
+                f(HeaderNameVariant::Titled(titled_header), value)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Set the status code
     pub fn set_status(&mut self, status: impl TryInto<StatusCode>) -> Result<()> {
         self.base.status = status
@@ -520,6 +617,7 @@ fn clone_req_parts(me: &ReqParts) -> ReqParts {
         .into_parts()
         .0;
     parts.headers = me.headers.clone();
+    parts.extensions = me.extensions.clone();
     parts
 }
 
@@ -532,6 +630,7 @@ fn clone_resp_parts(me: &RespParts) -> RespParts {
         .into_parts()
         .0;
     parts.headers = me.headers.clone();
+    parts.extensions = me.extensions.clone();
     parts
 }
 
@@ -623,17 +722,12 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
     const HEADER_KV_DELIMITER: &[u8; 2] = b": ";
 
     if let Some(key_map) = key_map {
-        let iter = key_map.iter().zip(value_map.iter());
-        for ((header, case_header), (header2, val)) in iter {
-            if header != header2 {
-                // in case the header iteration order changes in future versions of HMap
-                panic!("header iter mismatch {}, {}", header, header2)
-            }
+        case_header_iter(key_map.into(), value_map).for_each(|(case_header, val)| {
             buf.put_slice(case_header.as_slice());
             buf.put_slice(HEADER_KV_DELIMITER);
             buf.put_slice(val.as_ref());
             buf.put_slice(CRLF);
-        }
+        });
     } else {
         for (header, value) in value_map {
             let titled_header =
@@ -644,6 +738,23 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
             buf.put_slice(CRLF);
         }
     }
+}
+
+#[inline]
+fn case_header_iter<'a>(
+    name_map: Option<&'a CaseMap>,
+    value_map: &'a HMap,
+) -> impl Iterator<Item = (&'a CaseHeaderName, &'a HeaderValue)> + 'a {
+    name_map.into_iter().flat_map(|name_map| {
+        name_map
+            .iter()
+            .zip(value_map.iter())
+            .map(|((h1, name), (h2, value))| {
+                // in case the header iteration order changes in future versions of HMap
+                assert_eq!(h1, h2, "header iter mismatch {}, {}", h1, h2);
+                (name, value)
+            })
+    })
 }
 
 #[cfg(test)]
@@ -665,6 +776,17 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         req.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"FoO: Bar\r\n");
+        req.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
 
         let mut resp = ResponseHeader::new(None);
         resp.insert_header("foo", "bar").unwrap();
@@ -672,6 +794,17 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"FoO: Bar\r\n");
+        resp.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
     }
 
     #[test]
@@ -682,6 +815,9 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         req.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
+        req.case_header_iter().for_each(|(_, _)| {
+            unreachable!("request has no case");
+        });
 
         let mut resp = ResponseHeader::new_no_case(None);
         resp.insert_header("foo", "bar").unwrap();
@@ -689,6 +825,9 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
+        resp.case_header_iter().for_each(|(_, _)| {
+            unreachable!("response has no case");
+        });
     }
 
     #[test]
@@ -707,6 +846,29 @@ mod tests {
             buf,
             b"FoO: Bar\r\nfOO: bar\r\nBAZ: baR\r\nContent-Length: 0\r\n"
         );
+        req.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                2 => {
+                    assert_eq!(name, "fOO");
+                    assert_eq!(value, "bar");
+                }
+                3 => {
+                    assert_eq!(name, "BAZ");
+                    assert_eq!(value, "baR");
+                }
+                4 => {
+                    assert_eq!(name, "Content-Length");
+                    assert_eq!(value, "0");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
 
         let mut resp = ResponseHeader::new(None);
         resp.append_header("FoO", "Bar").unwrap();
@@ -722,6 +884,29 @@ mod tests {
             buf,
             b"FoO: Bar\r\nfOO: bar\r\nBAZ: baR\r\nContent-Length: 0\r\n"
         );
+        resp.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                2 => {
+                    assert_eq!(name, "fOO");
+                    assert_eq!(value, "bar");
+                }
+                3 => {
+                    assert_eq!(name, "BAZ");
+                    assert_eq!(value, "baR");
+                }
+                4 => {
+                    assert_eq!(name, "Content-Length");
+                    assert_eq!(value, "0");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
     }
 
     #[cfg(feature = "patched_http1")]

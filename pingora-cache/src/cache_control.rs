@@ -255,16 +255,13 @@ impl CacheControl {
         self.has_key_without_value("private")
     }
 
-    fn get_field_names(&self, key: &str) -> Option<ListValueIter> {
-        if let Some(Some(value)) = self.directives.get(key) {
-            Some(ListValueIter::from(value))
-        } else {
-            None
-        }
+    fn get_field_names(&self, key: &str) -> Option<ListValueIter<'_>> {
+        let value = self.directives.get(key)?.as_ref()?;
+        Some(ListValueIter::from(value))
     }
 
     /// Get the values of `private=`
-    pub fn private_field_names(&self) -> Option<ListValueIter> {
+    pub fn private_field_names(&self) -> Option<ListValueIter<'_>> {
         self.get_field_names("private")
     }
 
@@ -274,7 +271,7 @@ impl CacheControl {
     }
 
     /// Get the values of `no-cache=`
-    pub fn no_cache_field_names(&self) -> Option<ListValueIter> {
+    pub fn no_cache_field_names(&self) -> Option<ListValueIter<'_>> {
         self.get_field_names("no-cache")
     }
 
@@ -350,15 +347,13 @@ impl InterpretCacheControl for CacheControl {
             // always treated as stale
             return Some(Duration::ZERO);
         }
-        match self.s_maxage() {
-            Ok(Some(duration)) => Some(Duration::from_secs(duration as u64)),
+        let seconds = self
+            .s_maxage()
+            .ok()?
             // s-maxage not present
-            Ok(None) => match self.max_age() {
-                Ok(Some(duration)) => Some(Duration::from_secs(duration as u64)),
-                _ => None,
-            },
-            _ => None,
-        }
+            .or_else(|| self.max_age().unwrap_or(None))
+            .map(|duration| Duration::from_secs(duration as u64))?;
+        Some(seconds)
     }
 
     fn serve_stale_while_revalidate_duration(&self) -> Option<Duration> {

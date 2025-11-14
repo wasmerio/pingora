@@ -15,7 +15,7 @@
 use super::*;
 use pingora_cache::{
     key::HashBinary,
-    CacheKey, CacheMeta, ForcedInvalidationKind, HitHandler,
+    CacheKey, CacheMeta, ForcedFreshness, HitHandler,
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
@@ -144,7 +144,7 @@ pub trait ProxyHttp {
         Ok(CacheKey::default(req_header))
     }
 
-    /// This callback is invoked when a cacheable response is ready to be admitted to cache
+    /// This callback is invoked when a cacheable response is ready to be admitted to cache.
     fn cache_miss(&self, session: &mut Session, _ctx: &mut Self::CTX) {
         session.cache.cache_miss();
     }
@@ -165,7 +165,7 @@ pub trait ProxyHttp {
         _hit_handler: &mut HitHandler,
         _is_fresh: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<ForcedInvalidationKind>>
+    ) -> Result<Option<ForcedFreshness>>
     where
         Self::CTX: Send + Sync,
     {
@@ -281,12 +281,15 @@ pub trait ProxyHttp {
     /// Responses served from cache won't trigger this filter. If the cache needed revalidation,
     /// only the 304 from upstream will trigger the filter (though it will be merged into the
     /// cached header, not served directly to downstream).
-    fn upstream_response_filter(
+    async fn upstream_response_filter(
         &self,
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(())
     }
 
@@ -306,6 +309,51 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    // custom_forwarding is called when downstream and upstream connections are successfully established.
+    #[doc(hidden)]
+    async fn custom_forwarding(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+        _custom_message_to_downstream: mpsc::Sender<Bytes>,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    // received a custom message from the downstream before sending it to the upstream.
+    #[doc(hidden)]
+    async fn downstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(Some(custom_message))
+    }
+
+    // received a custom message from the upstream before sending it to the downstream.
+    #[doc(hidden)]
+    async fn upstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(Some(custom_message))
+    }
+
     /// Similar to [Self::upstream_response_filter()] but for response body
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
@@ -316,8 +364,8 @@ pub trait ProxyHttp {
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<Option<Duration>> {
+        Ok(None)
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers

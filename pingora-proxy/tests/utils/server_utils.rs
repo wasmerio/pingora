@@ -30,7 +30,7 @@ use pingora_cache::{
     RespCacheable,
 };
 use pingora_cache::{
-    CacheOptionOverrides, ForcedInvalidationKind, HitHandler, PurgeType, VarianceBuilder,
+    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
 };
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
@@ -50,6 +50,9 @@ use std::thread;
 use std::time::Duration;
 
 pub struct ExampleProxyHttps {}
+
+pub const TEST_PSK_IDENTITY: &str = "test-psk-identity";
+pub const TEST_PSK_SECRET: &str = "i2Wx8jrYVi5Vt7HSL/fsk003+PnmfcFuwWMsUyQvcZ4=";
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Default)]
@@ -134,7 +137,10 @@ impl ProxyHttp for ExampleProxyHttps {
             .get("x-port")
             .map_or("8443", |v| v.to_str().unwrap());
         let sni = req.headers.get("sni").map_or("", |v| v.to_str().unwrap());
-        let alt = req.headers.get("alt").map_or("", |v| v.to_str().unwrap());
+        let alt = req
+            .headers
+            .get("alt")
+            .map(|v| v.to_str().unwrap().to_string());
 
         let client_cert = session.get_header_bytes("client_cert");
 
@@ -143,7 +149,7 @@ impl ProxyHttp for ExampleProxyHttps {
             true,
             sni.to_string(),
         ));
-        peer.options.alternative_cn = Some(alt.to_string());
+        peer.options.alternative_cn = alt;
 
         let verify = session.get_header_bytes("verify") == b"1";
         peer.options.verify_cert = verify;
@@ -160,7 +166,30 @@ impl ProxyHttp for ExampleProxyHttps {
             if session.get_header_bytes("client_intermediate") == b"1" {
                 certs.push(cert::INTERMEDIATE_CERT.clone());
             }
-            peer.client_cert_key = Some(Arc::new(CertKey::new(certs, key)));
+            #[cfg(feature = "s2n")]
+            {
+                let combined_pem = certs.into_iter().flatten().collect();
+                peer.client_cert_key = Some(Arc::new(CertKey::new(combined_pem, key)));
+            }
+            #[cfg(not(feature = "s2n"))]
+            {
+                peer.client_cert_key = Some(Arc::new(CertKey::new(certs, key)));
+            }
+        }
+
+        #[cfg(feature = "s2n")]
+        if let Some(psk_identity) = req.headers.get("psk_identity") {
+            use pingora_core::{
+                protocols::tls::{Psk, PskConfig},
+                tls::PskHmac,
+            };
+
+            let psk = Psk::new(
+                psk_identity.to_str().unwrap().to_string(),
+                TEST_PSK_SECRET.as_bytes().to_vec(),
+                PskHmac::SHA256,
+            );
+            peer.options.psk = Some(Arc::new(PskConfig::new(vec![psk])));
         }
 
         if session.get_header_bytes("x-h2") == b"true" {
@@ -467,19 +496,22 @@ impl ProxyHttp for ExampleProxyCache {
         _hit_handler: &mut HitHandler,
         is_fresh: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<ForcedInvalidationKind>> {
+    ) -> Result<Option<ForcedFreshness>> {
         // allow test header to control force expiry/miss
         if session.get_header_bytes("x-force-miss") != b"" {
-            return Ok(Some(ForcedInvalidationKind::ForceMiss));
+            return Ok(Some(ForcedFreshness::ForceMiss));
         }
 
         if !is_fresh {
+            if session.get_header_bytes("x-force-fresh") != b"" {
+                return Ok(Some(ForcedFreshness::ForceFresh));
+            }
             // already expired
             return Ok(None);
         }
 
         if session.get_header_bytes("x-force-expire") != b"" {
-            return Ok(Some(ForcedInvalidationKind::ForceExpired));
+            return Ok(Some(ForcedFreshness::ForceExpired));
         }
         Ok(None)
     }
@@ -555,15 +587,12 @@ impl ProxyHttp for ExampleProxyCache {
         ))
     }
 
-    fn upstream_response_filter(
+    async fn upstream_response_filter(
         &self,
         _session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
+    ) -> Result<()> {
         ctx.upstream_status = Some(upstream_response.status.into());
         Ok(())
     }
@@ -721,6 +750,17 @@ fn test_main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
+    #[cfg(feature = "any_tls")]
+    {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+        let mut tls_settings =
+            pingora_core::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        tls_settings.enable_h2();
+        proxy_service_cache.add_tls_with_settings("0.0.0.0:6153", None, tls_settings);
+    }
+
     let mut services: Vec<Box<dyn Service>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
@@ -751,11 +791,75 @@ impl Server {
     }
 }
 
+#[cfg(feature = "s2n")]
+pub struct PskTlsServer {
+    pub handle: thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "s2n")]
+impl PskTlsServer {
+    pub fn start() -> Self {
+        let server_handle = thread::spawn(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(Self::run_server());
+        });
+        PskTlsServer {
+            handle: server_handle,
+        }
+    }
+
+    async fn run_server() {
+        use pingora_core::{protocols::tls::S2NConnectionBuilder, tls::TlsAcceptor};
+        use pingora_core::{
+            protocols::tls::{Psk, PskConfig, PskType},
+            tls::{Config, PskHmac, S2NPolicy, DEFAULT_TLS13},
+        };
+        use tokio::net::TcpListener;
+
+        let psk = Psk::new(
+            TEST_PSK_IDENTITY.to_string(),
+            TEST_PSK_SECRET.as_bytes().to_vec(),
+            PskHmac::SHA256,
+        );
+        let psk_config = Arc::new(PskConfig::new(vec![psk]));
+
+        let addr: std::net::SocketAddr = "127.0.0.1:6151".parse().unwrap();
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let mut config_builder = Config::builder();
+        unsafe {
+            config_builder.disable_x509_verification();
+        }
+        config_builder.set_security_policy(&DEFAULT_TLS13).unwrap();
+        let config = config_builder.build().unwrap();
+
+        let connection_builder = S2NConnectionBuilder {
+            config: config.clone(),
+            psk_config: Some(psk_config.clone()),
+            security_policy: None,
+        };
+
+        let acceptor = TlsAcceptor::new(connection_builder);
+
+        loop {
+            use tokio::{io::AsyncWriteExt, net::tcp};
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.clone().accept(tcp_stream).await.unwrap();
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            stream.write(response).await.unwrap();
+            stream.shutdown().await;
+        }
+    }
+}
+
 // FIXME: this still allows multiple servers to spawn across integration tests
 pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
+#[cfg(feature = "s2n")]
+pub static TEST_PSK_TLS_SERVER: Lazy<PskTlsServer> = Lazy::new(PskTlsServer::start);
 use super::mock_origin::MOCK_ORIGIN;
 
 pub fn init() {
     let _ = *TEST_SERVER;
     let _ = *MOCK_ORIGIN;
+    #[cfg(feature = "s2n")]
+    let _ = *TEST_PSK_TLS_SERVER;
 }

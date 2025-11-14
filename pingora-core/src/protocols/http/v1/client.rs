@@ -308,7 +308,7 @@ impl HttpSession {
                 HeaderParseState::Invalid(e) => {
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {}", String::from_utf8_lossy(&buf).escape_default()),
+                        format!("buf: {}", buf.escape_ascii()),
                         e,
                     );
                 }
@@ -716,7 +716,7 @@ fn parse_resp_buffer<'buf>(
 
 // TODO: change it to to_buf
 #[inline]
-pub(crate) fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
+pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
     let mut buf = BytesMut::with_capacity(512);
 
     // Request-Line

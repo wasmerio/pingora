@@ -18,14 +18,17 @@ use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
-use pingora_cache::{ForcedInvalidationKind, HitStatus, RespCacheable::*};
+use pingora_cache::{ForcedFreshness, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
 
-impl<SV> HttpProxy<SV> {
+impl<SV, C> HttpProxy<SV, C>
+where
+    C: custom::Connector,
+{
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache(
         self: &Arc<Self>,
@@ -137,13 +140,14 @@ impl<SV> HttpProxy<SV> {
                                     HitStatus::Expired
                                 }
                             }
-                            Ok(Some(ForcedInvalidationKind::ForceExpired)) => {
+                            Ok(Some(ForcedFreshness::ForceExpired)) => {
                                 // force expired asset should not be serve as stale
                                 // because force expire is usually to remove data
                                 meta.disable_serve_stale();
                                 HitStatus::ForceExpired
                             }
-                            Ok(Some(ForcedInvalidationKind::ForceMiss)) => HitStatus::ForceMiss,
+                            Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
+                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::Fresh,
                         };
 
                         hit_status_opt = Some(hit_status);
@@ -471,17 +475,10 @@ impl<SV> HttpProxy<SV> {
             to_304(resp);
         }
         let header_only = not_modified || req.method == http::method::Method::HEAD;
-        if header_only {
-            if use_cache.is_on() {
-                // tell cache to stop after yielding header
-                use_cache.enable_header_only();
-            } else {
-                // headers only during cache miss, upstream should continue send
-                // body to cache, `session` will ignore body automatically because
-                // of the signature of `header` (304)
-                // TODO: we should drop body before/within this filter so that body
-                // filter only runs on data downstream sees
-            }
+        if header_only && use_cache.is_on() {
+            // tell cache to stop serving downstream after yielding header
+            // (misses will continue to allow admitting upstream into cache)
+            use_cache.enable_header_only();
         }
     }
 
@@ -537,6 +534,9 @@ impl<SV> HttpProxy<SV> {
                                 && meta.response_header().status == StatusCode::OK
                             {
                                 self.inner.cache_miss(session, ctx);
+                                if !session.cache.enabled() {
+                                    fill_cache = false;
+                                }
                             } else {
                                 // we've allowed caching on the next request,
                                 // but do not cache _this_ request if bypassed and not 200
@@ -680,7 +680,11 @@ impl<SV> HttpProxy<SV> {
                 if resp.status == StatusCode::NOT_MODIFIED {
                     if session.cache.maybe_cache_meta().is_some() {
                         // run upstream response filters on upstream 304 first
-                        if let Err(err) = self.inner.upstream_response_filter(session, resp, ctx) {
+                        if let Err(err) = self
+                            .inner
+                            .upstream_response_filter(session, resp, ctx)
+                            .await
+                        {
                             error!("upstream response filter error on 304: {err:?}");
                             session.cache.revalidate_uncacheable(
                                 *resp.clone(),
@@ -727,7 +731,7 @@ impl<SV> HttpProxy<SV> {
                                 // (downstream may have a different cacheability assessment and could cache the 304)
 
                                 //TODO: log more
-                                warn!("Uncacheable {reason:?} 304 received");
+                                debug!("Uncacheable {reason:?} 304 received");
                                 session.cache.response_became_uncacheable(reason);
                                 session.cache.revalidate_uncacheable(merged_header, reason);
                             }
@@ -959,7 +963,7 @@ pub mod range_filter {
         for _ in ranges_str.split(',') {
             range_count += 1;
             // TODO: make configurable
-            const MAX_RANGES: usize = 100;
+            const MAX_RANGES: usize = 200;
             if range_count >= MAX_RANGES {
                 // If we get more than MAX_RANGES ranges, return None for now to save parsing time
                 return RangeType::None;
@@ -1165,8 +1169,8 @@ pub mod range_filter {
             s.into_bytes()
         }
 
-        // Test 100 range limit for parsing.
-        let ranges = generate_range_header(101);
+        // Test 200 range limit for parsing.
+        let ranges = generate_range_header(201);
         assert_eq!(parse_range_header(&ranges, 1000), RangeType::None)
     }
 
@@ -1970,13 +1974,26 @@ pub mod range_filter {
 // miss/revalidation/error.
 #[derive(Debug)]
 pub(crate) enum ServeFromCache {
-    Off,                 // not using cache
-    CacheHeader,         // should serve cache header
-    CacheHeaderOnly,     // should serve cache header
-    CacheBody(bool), // should serve cache body with a bool to indicate if it has already called seek on the hit handler
-    CacheHeaderMiss, // should serve cache header but upstream response should be admitted to cache
-    CacheBodyMiss(bool), // should serve cache body but upstream response should be admitted to cache, bool to indicate seek status
-    Done,                // should serve cache body
+    // not using cache
+    Off,
+    // should serve cache header
+    CacheHeader,
+    // should serve cache header only
+    CacheHeaderOnly,
+    // should serve cache header only but upstream response should be admitted to cache
+    CacheHeaderOnlyMiss,
+    // should serve cache body with a bool to indicate if it has already called seek on the hit handler
+    CacheBody(bool),
+    // should serve cache header but upstream response should be admitted to cache
+    // This is the starting state for misses, which go to CacheBodyMiss or
+    // CacheHeaderOnlyMiss before ending at DoneMiss
+    CacheHeaderMiss,
+    // should serve cache body but upstream response should be admitted to cache, bool to indicate seek status
+    CacheBodyMiss(bool),
+    // done serving cache body
+    Done,
+    // done serving cache body, but upstream response should continue to be admitted to cache
+    DoneMiss,
 }
 
 impl ServeFromCache {
@@ -1989,10 +2006,18 @@ impl ServeFromCache {
     }
 
     pub fn is_miss(&self) -> bool {
-        matches!(self, Self::CacheHeaderMiss | Self::CacheBodyMiss(_))
+        matches!(
+            self,
+            Self::CacheHeaderMiss
+                | Self::CacheHeaderOnlyMiss
+                | Self::CacheBodyMiss(_)
+                | Self::DoneMiss
+        )
     }
 
     pub fn is_miss_header(&self) -> bool {
+        // NOTE: this check is for checking if miss was just enabled, so it is excluding
+        // HeaderOnlyMiss
         matches!(self, Self::CacheHeaderMiss)
     }
 
@@ -2020,8 +2045,15 @@ impl ServeFromCache {
 
     pub fn enable_header_only(&mut self) {
         match self {
-            Self::CacheBody(_) | Self::CacheBodyMiss(_) => *self = Self::Done, // TODO: make sure no body is read yet
-            _ => *self = Self::CacheHeaderOnly,
+            Self::CacheBody(_) => *self = Self::Done, // TODO: make sure no body is read yet
+            Self::CacheBodyMiss(_) => *self = Self::DoneMiss,
+            _ => {
+                if self.is_miss() {
+                    *self = Self::CacheHeaderOnlyMiss;
+                } else {
+                    *self = Self::CacheHeaderOnly;
+                }
+            }
         }
     }
 
@@ -2051,6 +2083,10 @@ impl ServeFromCache {
                 *self = Self::Done;
                 Ok(HttpTask::Header(cache_hit_header(cache), true))
             }
+            Self::CacheHeaderOnlyMiss => {
+                *self = Self::DoneMiss;
+                Ok(HttpTask::Header(cache_hit_header(cache), true))
+            }
             Self::CacheBody(should_seek) => {
                 if *should_seek {
                     self.maybe_seek_hit_handler(cache, range)?;
@@ -2070,11 +2106,12 @@ impl ServeFromCache {
                 if let Some(b) = cache.miss_body_reader().unwrap().read_body().await? {
                     Ok(HttpTask::Body(Some(b), false)) // false for now
                 } else {
-                    *self = Self::Done;
+                    *self = Self::DoneMiss;
                     Ok(HttpTask::Done)
                 }
             }
             Self::Done => Ok(HttpTask::Done),
+            Self::DoneMiss => Ok(HttpTask::Done),
         }
     }
 

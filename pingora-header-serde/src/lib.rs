@@ -26,7 +26,7 @@ mod thread_zstd;
 
 use bytes::BufMut;
 use http::Version;
-use pingora_error::{Error, ErrorType, Result};
+use pingora_error::{Error, ErrorType, ImmutStr, Result};
 use pingora_http::ResponseHeader;
 use std::cell::RefCell;
 use std::ops::DerefMut;
@@ -42,7 +42,8 @@ pub struct HeaderSerde {
     buf: ThreadLocal<RefCell<Vec<u8>>>,
 }
 
-const MAX_HEADER_SIZE: usize = 64 * 1024;
+const MAX_HEADER_BUF_SIZE: usize = 128 * 1024; // 128KB
+
 const COMPRESS_LEVEL: i32 = 3;
 
 impl HeaderSerde {
@@ -76,7 +77,7 @@ impl HeaderSerde {
         // TODO: should convert to h1 if the incoming header is for h2
         let mut buf = self
             .buf
-            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_SIZE)))
+            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_BUF_SIZE)))
             .borrow_mut();
         buf.clear(); // reset the buf
         resp_header_to_buf(header, &mut buf);
@@ -87,7 +88,7 @@ impl HeaderSerde {
     pub fn deserialize(&self, data: &[u8]) -> Result<ResponseHeader> {
         let mut buf = self
             .buf
-            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_SIZE)))
+            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_BUF_SIZE)))
             .borrow_mut();
         buf.clear(); // reset the buf
         self.compression
@@ -104,7 +105,7 @@ enum ZstdCompression {
 }
 
 #[inline]
-fn into_error(e: &'static str, context: &'static str) -> Box<Error> {
+fn into_error<S: Into<ImmutStr>>(e: &'static str, context: S) -> Box<Error> {
     Error::because(ErrorType::InternalError, context, e)
 }
 
@@ -113,22 +114,51 @@ impl ZstdCompression {
         match &self {
             ZstdCompression::Default(c, level) => c
                 .compress(data, *level)
-                .map_err(|e| into_error(e, "decompress header")),
+                .map_err(|e| into_error(e, "compress header")),
             ZstdCompression::WithDict(c) => c
                 .compress(data)
-                .map_err(|e| into_error(e, "decompress header")),
+                .map_err(|e| into_error(e, "compress header")),
         }
     }
 
     fn decompress_to_buffer(&self, source: &[u8], destination: &mut Vec<u8>) -> Result<usize> {
         match &self {
-            ZstdCompression::Default(c, _) => c
-                .decompress_to_buffer(source, destination)
-                .map_err(|e| into_error(e, "decompress header")),
-            ZstdCompression::WithDict(c) => c
-                .decompress_to_buffer(source, destination)
-                .map_err(|e| into_error(e, "decompress header")),
+            ZstdCompression::Default(c, _) => {
+                c.decompress_to_buffer(source, destination).map_err(|e| {
+                    into_error(
+                        e,
+                        format!(
+                            "decompress header, frame_content_size: {}",
+                            get_frame_content_size(source)
+                        ),
+                    )
+                })
+            }
+            ZstdCompression::WithDict(c) => {
+                c.decompress_to_buffer(source, destination).map_err(|e| {
+                    into_error(
+                        e,
+                        format!(
+                            "decompress header, frame_content_size: {}",
+                            get_frame_content_size(source)
+                        ),
+                    )
+                })
+            }
         }
+    }
+}
+
+#[inline]
+fn get_frame_content_size(source: &[u8]) -> ImmutStr {
+    match zstd_safe::get_frame_content_size(source) {
+        Ok(Some(size)) => match size {
+            zstd_safe::CONTENTSIZE_ERROR => ImmutStr::from("invalid"),
+            zstd_safe::CONTENTSIZE_UNKNOWN => ImmutStr::from("unknown"),
+            _ => ImmutStr::from(size.to_string()),
+        },
+        Ok(None) => ImmutStr::from("none"),
+        Err(_e) => ImmutStr::from("failed"),
     }
 }
 
@@ -178,7 +208,8 @@ fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
         Err(e) => Error::e_because(
             ErrorType::InternalError,
             format!(
-                "parsing failed on uncompressed header, {}",
+                "parsing failed on uncompressed header, len={}, content={:?}",
+                buf.len(),
                 String::from_utf8_lossy(buf)
             ),
             e,
@@ -230,5 +261,34 @@ mod tests {
         let header2 = serde.deserialize(&compressed).unwrap();
         assert_eq!(header.status, header2.status);
         assert_eq!(header.headers, header2.headers);
+    }
+
+    #[test]
+    fn test_no_headers() {
+        let serde = HeaderSerde::new(None);
+        let header = ResponseHeader::build(200, None).unwrap(); // No headers added
+
+        // Serialize and deserialize
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+
+        assert_eq!(header.status, header2.status);
+        assert_eq!(header.headers.len(), 0);
+        assert_eq!(header2.headers.len(), 0);
+    }
+
+    #[test]
+    fn test_empty_header_wire_format() {
+        let header = ResponseHeader::build(200, None).unwrap();
+        let mut buf = vec![];
+        resp_header_to_buf(&header, &mut buf);
+
+        // Should be: "HTTP/1.1 200 OK\r\n\r\n", total 19 bytes
+        assert_eq!(buf.len(), 19);
+        assert_eq!(buf, b"HTTP/1.1 200 OK\r\n\r\n");
+
+        // Test that httparse can handle this
+        let parsed = buf_to_http_header(&buf).unwrap();
+        assert_eq!(parsed.status.as_u16(), 200);
     }
 }

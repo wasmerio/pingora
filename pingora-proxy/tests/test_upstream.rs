@@ -670,6 +670,48 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_force_fresh() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_force_fresh/revalidate_now";
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        // stale, but can be forced fresh
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-force-fresh", "1")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(!headers.contains_key("x-upstream-status"));
+        let cache_miss_epoch2 = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(cache_miss_epoch, cache_miss_epoch2);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_cache_downstream_revalidation_etag() {
         init();
         let url = "http://127.0.0.1:6148/unique/test_downstream_revalidation_etag/revalidate_now";
@@ -2306,6 +2348,108 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello world!");
     }
 
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_uncacheable() {
+        init();
+        let url = "http://127.0.0.1:6148/slow_body/test_caching_when_downstream_bails_uncacheable/";
+
+        tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-no-store", "1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "no-cache");
+            // exit without res.text().await so that we bail early
+        });
+        // sleep just a little to make sure the req above gets the cache lock
+        sleep(Duration::from_millis(50)).await;
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // entirely new request made to upstream, since the response was uncacheable
+        assert_eq!(headers["x-cache-status"], "no-cache"); // due to cache lock give up
+        assert_eq!(res.text().await.unwrap(), "hello world!");
+    }
+
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_header() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_when_downstream_bails_header/sleep";
+
+        tokio::spawn(async move {
+            // this should always time out
+            reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "2")
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .unwrap_err()
+        });
+        // sleep after cache fill
+        sleep(Duration::from_millis(2500)).await;
+
+        // next request should be a cache hit
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_header_uncacheable() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_when_downstream_bails_header_uncacheable/sleep";
+
+        tokio::spawn(async move {
+            // this should always time out
+            reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "2")
+                .header("x-no-store", "1")
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .unwrap_err()
+            // note that while the downstream error is ignored,
+            // once the response is uncacheable we will still attempt to write
+            // downstream and find a broken connection that terminates the request
+        });
+        // sleep after cache fill
+        sleep(Duration::from_millis(2500)).await;
+
+        // next request should be a cache miss, as the previous fill was uncacheable
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
     async fn send_vary_req_with_headers_with_dups(
         url: &str,
         vary_field: &str,
@@ -2864,6 +3008,69 @@ mod test_cache {
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_downstream_head_miss_conn_close_h1() {
+        init();
+
+        let test_url =
+            "http://127.0.0.1:6148/unique/test_cache_downstream_head_miss_conn_close/sleep/";
+
+        let res = reqwest::Client::new()
+            .head(test_url)
+            .header("x-set-body-sleep", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "");
+        // closed connection does not impact next cache fill
+
+        let res = reqwest::Client::new().get(test_url).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[cfg(feature = "any_tls")]
+    #[tokio::test]
+    async fn test_downstream_head_miss_conn_close_h2() {
+        init();
+
+        let test_url =
+            "https://127.0.0.1:6153/unique/test_cache_downstream_head_miss_conn_close/sleep/";
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let res = client
+            .head(test_url)
+            .header("x-set-body-sleep", "0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "");
+        // closed connection does not impact next cache fill
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let res = client.get(test_url).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 }

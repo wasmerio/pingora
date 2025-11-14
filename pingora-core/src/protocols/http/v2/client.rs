@@ -27,6 +27,7 @@ use pingora_timeout::timeout;
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
@@ -51,7 +52,7 @@ pub struct Http2Session {
     /// The timeout is reset on every write. This is not a timeout on the overall duration of the
     /// request.
     pub write_timeout: Option<Duration>,
-    pub(crate) conn: ConnectionRef,
+    pub conn: ConnectionRef,
     // Indicate that whether a END_STREAM is already sent
     ended: bool,
 }
@@ -129,16 +130,6 @@ impl Http2Session {
 
     /// Write a request body chunk
     pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
-        match self.write_timeout {
-            Some(t) => match timeout(t, self.do_write_request_body(data, end)).await {
-                Ok(res) => res,
-                Err(_) => Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}")),
-            },
-            None => self.do_write_request_body(data, end).await,
-        }
-    }
-
-    pub async fn do_write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             warn!("Try to write request body after end of stream, dropping the extra data");
             return Ok(());
@@ -149,7 +140,7 @@ impl Http2Session {
             .as_mut()
             .expect("Try to write request body before sending request header");
 
-        super::write_body(body_writer, data, end)
+        super::write_body(body_writer, data, end, self.write_timeout)
             .await
             .map_err(|e| self.handle_err(e))?;
         self.ended = self.ended || end;
@@ -186,7 +177,7 @@ impl Http2Session {
         }
 
         let Some(resp_fut) = self.resp_fut.take() else {
-            panic!("Try to  response header is already read")
+            panic!("Try to take response header, but it is already taken")
         };
 
         let res = match self.read_timeout {
@@ -201,6 +192,35 @@ impl Http2Session {
         self.response_body_reader = Some(body_reader);
 
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn poll_read_response_header(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), h2::Error>> {
+        if self.response_header.is_some() {
+            panic!("H2 response header is already read")
+        }
+
+        let Some(mut resp_fut) = self.resp_fut.take() else {
+            panic!("Try to take response header, but it is already taken")
+        };
+
+        let res = match resp_fut.poll_unpin(cx) {
+            Poll::Ready(Ok(res)) => res,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => {
+                self.resp_fut = Some(resp_fut);
+                return Poll::Pending;
+            }
+        };
+
+        let (resp, body_reader) = res.into_parts();
+        self.response_header = Some(resp.into());
+        self.response_body_reader = Some(body_reader);
+
+        Poll::Ready(Ok(()))
     }
 
     /// Read the response body
@@ -239,6 +259,30 @@ impl Http2Session {
         }
 
         Ok(body)
+    }
+
+    #[doc(hidden)]
+    pub fn poll_read_response_body(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        let Some(body_reader) = self.response_body_reader.as_mut() else {
+            // req is not sent or response is already read
+            // TODO: warn
+            return Poll::Ready(None);
+        };
+
+        let data = match ready!(body_reader.poll_data(cx)).transpose() {
+            Ok(data) => data,
+            Err(err) => return Poll::Ready(Some(Err(err))),
+        };
+
+        if let Some(data) = data {
+            body_reader.flow_control().release_capacity(data.len())?;
+            return Poll::Ready(Some(Ok(data)));
+        }
+
+        Poll::Ready(None)
     }
 
     /// Whether the response has ended
@@ -431,7 +475,8 @@ impl Http2Session {
  2. peer sends invalid h2 frames, usually sending h1 only header: we will downgrade and retry
  3. peer sends GO_AWAY(NO_ERROR) connection is being shut down: we will retry
  4. peer IO error on reused conn, usually firewall kills old conn: we will retry
- 5. All other errors will terminate the request
+ 5. peer sends REFUSED_STREAM on RST_STREAM, this is safe to retry
+ 6. All other errors will terminate the request
 */
 fn handle_read_header_error(e: h2::Error) -> Box<Error> {
     if e.is_remote() && (e.reason() == Some(h2::Reason::HTTP_1_1_REQUIRED)) {
@@ -445,6 +490,14 @@ fn handle_read_header_error(e: h2::Error) -> Box<Error> {
         err
     } else if e.is_go_away() && e.is_remote() && (e.reason() == Some(h2::Reason::NO_ERROR)) {
         // is_go_away: retry via another connection, this connection is being teardown
+        let mut err = Error::because(H2Error, "while reading h2 header", e);
+        err.retry = true.into();
+        err
+    } else if e.is_reset() && e.is_remote() && (e.reason() == Some(h2::Reason::REFUSED_STREAM)) {
+        // The REFUSED_STREAM error code can be included in a RST_STREAM frame to indicate
+        // that the stream is being closed prior to any processing having occurred.
+        // Any request that was sent on the reset stream can be safely retried.
+        // https://datatracker.ietf.org/doc/html/rfc9113#section-8.7
         let mut err = Error::because(H2Error, "while reading h2 header", e);
         err.retry = true.into();
         err

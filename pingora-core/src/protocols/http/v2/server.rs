@@ -26,6 +26,7 @@ use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::sync::Arc;
+use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
@@ -48,6 +49,7 @@ pub use h2::server::Builder as H2Options;
 pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Connection<Stream>> {
     let options = options.unwrap_or_default();
     let res = options.handshake(io).await;
+
     match res {
         Ok(connection) => {
             debug!("H2 handshake done.");
@@ -188,6 +190,27 @@ impl HttpSession {
         Ok(data)
     }
 
+    #[doc(hidden)]
+    pub fn poll_read_body_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        let data = match ready!(self.request_body_reader.poll_data(cx)).transpose() {
+            Ok(data) => data,
+            Err(err) => return Poll::Ready(Some(Err(err))),
+        };
+
+        if let Some(data) = data {
+            self.body_read += data.len();
+            self.request_body_reader
+                .flow_control()
+                .release_capacity(data.len())?;
+            return Poll::Ready(Some(Ok(data)));
+        }
+
+        Poll::Ready(None)
+    }
+
     async fn do_drain_request_body(&mut self) -> Result<()> {
         loop {
             match self.read_body_bytes().await {
@@ -222,10 +245,20 @@ impl HttpSession {
         self.write_timeout = timeout;
     }
 
+    /// Get the write timeout.
+    pub fn get_write_timeout(&self) -> Option<Duration> {
+        self.write_timeout
+    }
+
     /// Sets the total drain timeout. This `timeout` will be used while draining
     /// the request body.
     pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
         self.total_drain_timeout = timeout;
+    }
+
+    /// Get the total drain timeout.
+    pub fn get_total_drain_timeout(&self) -> Option<Duration> {
+        self.total_drain_timeout
     }
 
     // the write_* don't have timeouts because the actual writing happens on the connection
@@ -309,7 +342,7 @@ impl HttpSession {
             ));
         };
         let data_len = data.len();
-        super::write_body(writer, data, end)
+        super::write_body(writer, data, end, self.write_timeout)
             .await
             .map_err(|e| e.into_down())?;
         self.body_sent += data_len;
@@ -439,6 +472,11 @@ impl HttpSession {
         }
     }
 
+    #[doc(hidden)]
+    pub fn take_response_body_writer(&mut self) -> Option<SendStream<Bytes>> {
+        self.send_response_body.take()
+    }
+
     // This is a hack for pingora-proxy to create subrequests from h2 server session
     // TODO: be able to convert from h2 to h1 subrequest
     pub fn pseudo_raw_h1_request_header(&self) -> Bytes {
@@ -490,7 +528,7 @@ impl HttpSession {
     /// This async fn will be pending forever until the client closes the stream/connection
     /// This function is used for watching client status so that the server is able to cancel
     /// its internal tasks as the client waiting for the tasks goes away
-    pub fn idle(&mut self) -> Idle {
+    pub fn idle(&mut self) -> Idle<'_> {
         Idle(self)
     }
 

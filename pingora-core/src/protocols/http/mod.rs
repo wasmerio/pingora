@@ -14,14 +14,16 @@
 
 //! HTTP/1.x and HTTP/2 implementation APIs
 
-mod body_buffer;
+pub mod body_buffer;
 pub mod bridge;
 pub mod client;
 pub mod compression;
 pub mod conditional_filter;
-pub(crate) mod date;
+pub mod custom;
+pub mod date;
 pub mod error_resp;
 pub mod server;
+pub mod subrequest;
 pub mod v1;
 pub mod v2;
 
@@ -46,7 +48,7 @@ pub enum HttpTask {
 }
 
 impl HttpTask {
-    /// Whether this [`HttpTask`] means the end of the response
+    /// Whether this [`HttpTask`] means the end of the response.
     pub fn is_end(&self) -> bool {
         match self {
             HttpTask::Header(_, end) => *end,
@@ -54,6 +56,17 @@ impl HttpTask {
             HttpTask::Trailer(_) => true,
             HttpTask::Done => true,
             HttpTask::Failed(_) => true,
+        }
+    }
+
+    /// The [`HttpTask`] type as string.
+    pub fn type_str(&self) -> &'static str {
+        match self {
+            HttpTask::Header(..) => "Header",
+            HttpTask::Body(..) => "Body",
+            HttpTask::Trailer(_) => "Trailer",
+            HttpTask::Done => "Done",
+            HttpTask::Failed(_) => "Failed",
         }
     }
 }

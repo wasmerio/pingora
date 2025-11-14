@@ -21,7 +21,7 @@ use crate::RespCacheable::*;
 use cache_control::DELTA_SECONDS_OVERFLOW_VALUE;
 use http::{header, HeaderValue};
 use httpdate::HttpDate;
-use log::warn;
+use log::debug;
 use pingora_http::RequestHeader;
 
 /// Decide if the request can be cacheable
@@ -128,7 +128,7 @@ pub fn calculate_expires_header_time(resp_header: &RespHeader) -> Option<SystemT
         Some(SystemTime::from(
             expires
                 .parse::<HttpDate>()
-                .map_err(|e| warn!("Invalid HttpDate in Expires: {}, error: {}", expires, e))
+                .map_err(|e| debug!("Invalid HttpDate in Expires: {}, error: {}", expires, e))
                 .ok()?,
         ))
     }
@@ -177,7 +177,7 @@ pub mod upstream {
     ///
     /// When `meta` is set, this function will inject `If-modified-since` according to the `Last-Modified` header
     /// and inject `If-none-match` according to `Etag` header
-    pub fn request_filter(req: &mut RequestHeader, meta: Option<&CacheMeta>) -> Result<()> {
+    pub fn request_filter(req: &mut RequestHeader, meta: Option<&CacheMeta>) {
         // change HEAD to GET, HEAD itself is not semantically cacheable
         if req.method == Method::HEAD {
             req.set_method(Method::GET);
@@ -206,8 +206,6 @@ pub mod upstream {
                 req.insert_header(header::IF_NONE_MATCH, etag).unwrap();
             }
         }
-
-        Ok(())
     }
 }
 
