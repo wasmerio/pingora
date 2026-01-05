@@ -28,7 +28,7 @@ use crate::server::ShutdownWatch;
 use crate::services::Service as ServiceTrait;
 
 use async_trait::async_trait;
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use pingora_error::Result;
 use pingora_runtime::current_handle;
 use pingora_timeout::timeout;
@@ -176,15 +176,15 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                                     Err(e) => {
                                         // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
                                         if let Some(addr) = peer_addr {
-                                            error!("Downstream handshake error from {}: {e}", addr);
+                                            trace!("Downstream handshake error from {}: {e}", addr);
                                         } else {
-                                            error!("Downstream handshake error: {e}");
+                                            trace!("Downstream handshake error: {e}");
                                         }
                                     }
                                 }
                             }
                             Err(_) => {
-                                error!("Downstream handshake timeout");
+                                trace!("Downstream handshake timeout");
                             }
                         }
                     });

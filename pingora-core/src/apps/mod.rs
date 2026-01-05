@@ -19,6 +19,7 @@ pub mod prometheus_http_app;
 
 use crate::server::ShutdownWatch;
 use async_trait::async_trait;
+use log::trace;
 use log::{debug, error};
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -195,7 +196,7 @@ where
             let h2_conn = server::handshake(stream, h2_options).await;
             let mut h2_conn = match h2_conn {
                 Err(e) => {
-                    error!("H2 handshake error {e}");
+                    trace!("H2 handshake error {e}");
                     return None;
                 }
                 Ok(c) => c,
