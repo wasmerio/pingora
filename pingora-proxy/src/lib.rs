@@ -198,7 +198,7 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!("Fail to proxy: {e}");
+                trace!("Fail to proxy: {e}");
                 if matches!(e.etype, InvalidHTTPHeader) {
                     downstream_session
                         .respond_error(400)
