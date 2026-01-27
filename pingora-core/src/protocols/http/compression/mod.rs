@@ -27,6 +27,7 @@ use std::time::Duration;
 use strum::EnumCount;
 use strum_macros::EnumCount as EnumCountMacro;
 
+#[cfg(feature = "brotli")]
 mod brotli;
 mod gzip;
 mod zstd;
@@ -257,10 +258,11 @@ impl ResponseCompressionCtx {
                     }
                     Action::Decompress(algorithm) => {
                         let idx = algorithm.index();
-                        (
-                            algorithm.decompressor(decompress_enable[idx]),
-                            preserve_etag[idx],
-                        )
+                        let decompressor = algorithm.decompressor(decompress_enable[idx]);
+                        if decompressor.is_none() && decompress_enable[idx] {
+                            warn!("Decompression enabled for {algorithm:?} but not supported");
+                        }
+                        (decompressor, preserve_etag[idx])
                     }
                 };
                 if encoder.is_some() {
@@ -355,6 +357,7 @@ impl Algorithm {
         } else {
             match self {
                 Self::Gzip => Some(Box::new(gzip::Compressor::new(level))),
+                #[cfg(feature = "brotli")]
                 Self::Brotli => Some(Box::new(brotli::Compressor::new(level))),
                 Self::Zstd => Some(Box::new(zstd::Compressor::new(level))),
                 _ => None, // not implemented
@@ -368,6 +371,7 @@ impl Algorithm {
         } else {
             match self {
                 Self::Gzip => Some(Box::new(gzip::Decompressor::new())),
+                #[cfg(feature = "brotli")]
                 Self::Brotli => Some(Box::new(brotli::Decompressor::new())),
                 _ => None, // not implemented
             }
@@ -466,8 +470,12 @@ fn test_accept_encoding_req_header() {
         header.headers.get(http::header::ACCEPT_ENCODING),
         &mut ac_list,
     );
+    #[cfg(feature = "brotli")]
     assert_eq!(ac_list[0], Algorithm::Brotli);
+    #[cfg(feature = "brotli")]
     assert_eq!(ac_list[1], Algorithm::Gzip);
+    #[cfg(not(feature = "brotli"))]
+    assert_eq!(ac_list[0], Algorithm::Gzip);
 }
 
 // test whether the response depends on Accept-Encoding header

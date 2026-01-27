@@ -55,7 +55,8 @@ serde_yaml = "0.8"
 hyperlocal = "0.8"
 
 [features]
-default = []
+default = ["brotli"]
+brotli = ["pingora-core/brotli"]
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
 boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl", "openssl_derived"]
 rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]

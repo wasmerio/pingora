@@ -64,7 +64,7 @@ sfv = "0.10.4"
 rand = "0.8"
 ahash = { workspace = true }
 unicase = "2"
-brotli = "3"
+brotli = { version = "3", optional = true }
 openssl-probe = "0.1.6"
 tokio-test = "0.4"
 zstd = "0"
@@ -96,7 +96,8 @@ hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = []
+default = ["brotli"]
+brotli = ["dep:brotli"]
 openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]

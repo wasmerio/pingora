@@ -52,12 +52,13 @@ hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = []
+default = ["brotli"]
 
-#! ### Tls
-#! Tls is provided by adding one of these features. If no tls-providing feature
-#! is added, only unencrypted http. Only one tls-providing feature can be
-#! selected at a time
+## Enable brotli compression/decompression
+brotli = [
+    "pingora-core/brotli",
+    "pingora-proxy?/brotli",
+]
 
 ## Use [OpenSSL](https://crates.io/crates/openssl) for tls
 ##
