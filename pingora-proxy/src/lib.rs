@@ -751,7 +751,7 @@ where
                         break;
                     }
                     // only log error that will be retried here, the final error will be logged below
-                    warn!(
+                    trace!(
                         "Fail to proxy: {}, tries: {}, retry: {}, {}",
                         proxy_error.as_ref().unwrap(),
                         retries,
