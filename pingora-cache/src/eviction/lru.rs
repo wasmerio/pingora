@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -124,6 +124,12 @@ impl<const N: usize> Manager<N> {
             .or_err(InternalError, "when deserializing LRU")?;
         Ok(())
     }
+
+    /// Peek the weight associated with a cache key without changing its LRU order.
+    pub fn peek_weight(&self, item: &CompactCacheKey) -> Option<usize> {
+        let key = u64key(item);
+        self.0.peek_weight(key)
+    }
 }
 
 struct InsertToManager<'a, const N: usize> {
@@ -194,9 +200,14 @@ impl<const N: usize> EvictionManager for Manager<N> {
             .collect()
     }
 
-    fn increment_weight(&self, item: CompactCacheKey, delta: usize) -> Vec<CompactCacheKey> {
-        let key = u64key(&item);
-        self.0.increment_weight(key, delta);
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey> {
+        let key = u64key(item);
+        self.0.increment_weight(key, delta, max_weight);
         self.0
             .evict_to_limit()
             .into_iter()

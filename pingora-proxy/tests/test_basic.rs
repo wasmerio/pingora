@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,15 @@ mod utils;
 use bytes::Bytes;
 use h2::client;
 use http::Request;
-use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
+use http_body_util::BodyExt;
+use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
+#[cfg(feature = "patched_http1")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "patched_http1")]
+use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use utils::server_utils::init;
@@ -160,21 +165,21 @@ async fn test_h2_to_h2() {
 async fn test_h2c_to_h2c() {
     init();
 
-    let client = hyper::client::Client::builder()
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .http2_only(true)
-        .build_http();
+        .build_http::<http_body_util::Empty<Bytes>>();
 
-    let mut req = hyper::Request::builder()
+    let mut req = http::Request::builder()
         .uri("http://127.0.0.1:6146")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
     req.headers_mut()
-        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+        .insert("x-h2", http::HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
 
-    let body = res.into_body().data().await.unwrap().unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
@@ -182,21 +187,21 @@ async fn test_h2c_to_h2c() {
 async fn test_h1_on_h2c_port() {
     init();
 
-    let client = hyper::client::Client::builder()
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .http2_only(false)
-        .build_http();
+        .build_http::<http_body_util::Empty<Bytes>>();
 
-    let mut req = hyper::Request::builder()
+    let mut req = http::Request::builder()
         .uri("http://127.0.0.1:6146")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
     req.headers_mut()
-        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+        .insert("x-h2", http::HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_11);
 
-    let body = res.into_body().data().await.unwrap().unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
@@ -302,7 +307,7 @@ async fn test_h2_head() {
 async fn test_simple_proxy_uds() {
     init();
     let url = Uri::new("/tmp/pingora_proxy.sock", "/").into();
-    let client = Client::unix();
+    let client: Client<hyperlocal::UnixConnector, http_body_util::Empty<Bytes>> = Client::unix();
 
     let res = client.get(url).await.unwrap();
 
@@ -323,7 +328,10 @@ async fn test_simple_proxy_uds() {
     assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
     assert!(is_specified_port(sockaddr.port()));
 
-    let body = hyper::body::to_bytes(body).await.unwrap();
+    let body = http_body_util::BodyExt::collect(body)
+        .await
+        .unwrap()
+        .to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
@@ -743,6 +751,81 @@ async fn test_connect_close() {
     assert_eq!(headers[header::CONNECTION], "close");
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
+}
+
+// Authority-form CONNECT request targets require patched HTTP/1 parsing until
+// general request-target form support is available.
+#[cfg(feature = "patched_http1")]
+#[tokio::test]
+async fn test_connect_proxying_disallowed_h1() {
+    init();
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let request = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+    stream.write_all(request).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 405 "));
+}
+
+#[tokio::test]
+async fn test_connect_proxying_disallowed_h2() {
+    init();
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut h2, connection) = client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+
+    let request = Request::builder()
+        .method("CONNECT")
+        .uri("http://pingora.org:443/")
+        .body(())
+        .unwrap();
+    let (response, _body) = h2.send_request(request, true).unwrap();
+    let (head, mut body) = response.await.unwrap().into_parts();
+    assert_eq!(head.status.as_u16(), 405);
+    while let Some(chunk) = body.data().await {
+        assert!(chunk.unwrap().is_empty());
+    }
+}
+
+#[cfg(feature = "patched_http1")]
+#[tokio::test]
+async fn test_connect_proxying_allowed_h1() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    // Note per RFC CONNECT 2xx responses are not allowed to have response
+    // bodies, so this is non-standard behavior.
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        socket.write_all(response).await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "));
+    assert!(resp.ends_with("ok"));
 }
 
 #[tokio::test]

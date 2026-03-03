@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -115,12 +115,13 @@ where
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            match custom_session.restore_custom_message_writer(
-                downstream_custom_message_writer.expect("downstream be present"),
-            ) {
-                Ok(_) => { /* continue */ }
-                Err(e) => {
-                    return (false, false, Some(e));
+            if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
+                match custom_session.restore_custom_message_writer(downstream_custom_message_writer)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, false, Some(e));
+                    }
                 }
             }
         }
@@ -149,6 +150,8 @@ where
         #[cfg(unix)]
         let raw = client_session.id();
 
+        let initial_write_pending = client_session.stream().get_write_pending_time();
+
         if let Err(e) = self
             .inner
             .connected_to_upstream(
@@ -167,6 +170,15 @@ where
         let (server_session_reuse, client_session_reuse, error) =
             self.proxy_1to1(session, client_session, peer, ctx).await;
 
+        // Record upstream response body bytes received (payload only) for logging consumers.
+        let upstream_bytes_total = client_session.body_bytes_received();
+        session.set_upstream_body_bytes_received(upstream_bytes_total);
+
+        // Record upstream write pending time for this session only (delta from baseline).
+        let current_write_pending = client_session.stream().get_write_pending_time();
+        let upstream_write_pending = current_write_pending.saturating_sub(initial_write_pending);
+        session.set_upstream_write_pending_time(upstream_write_pending);
+
         (server_session_reuse, client_session_reuse, error)
     }
 
@@ -183,6 +195,7 @@ where
         let mut request_done = false;
         let mut response_done = false;
         let mut send_error = None;
+        let mut upgraded = false;
 
         /* duplex mode, wait for either to complete */
         while !request_done || !response_done {
@@ -191,6 +204,14 @@ where
                     match res {
                         Ok(task) => {
                             response_done = task.is_end();
+                            if !upgraded && client_session.was_upgraded() {
+                                // upgrade can only happen once
+                                upgraded = true;
+                                if send_error.is_none() {
+                                    // continue receiving from downstream after body mode change
+                                    request_done = false;
+                                }
+                            }
                             let type_str = task.type_str();
                             let result = tx.send(task)
                                 .await.or_err_with(
@@ -203,7 +224,7 @@ where
                             // In that case, this function should ignore that the pipe is closed.
                             // So that this function could read the rest events from rx including
                             // the closure, then exit.
-                            if result.is_err() && !client_session.is_upgrade_req() {
+                            if result.is_err() && !client_session.was_upgraded() {
                                 return result;
                             }
                         },
@@ -222,7 +243,7 @@ where
                         Ok(send_done) => {
                             request_done = send_done;
                             // An upgraded request is terminated when either side is done
-                            if request_done && client_session.is_upgrade_req() {
+                            if request_done && client_session.was_upgraded() {
                                 response_done = true;
                             }
                         },
@@ -349,6 +370,7 @@ where
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
+            let upgraded = session.was_upgraded();
 
             tokio::select! {
                 // only try to send to pipe if there is capacity to avoid deadlock
@@ -371,6 +393,9 @@ where
                                     e,
                                     self.inner.request_summary(session, ctx)
                                 );
+                                // This will not be treated as a final error, but we should signal to
+                                // downstream session regardless
+                                session.downstream_session.on_proxy_failure(e);
                                 continue;
                            } else {
                                 return Err(e.into_down());
@@ -379,7 +404,7 @@ where
                     };
                     // If the request is websocket, `None` body means the request is closed.
                     // Set the response to be done as well so that the request completes normally.
-                    if body.is_none() && session.is_upgrade_req() {
+                    if body.is_none() && session.was_upgraded() {
                         response_state.maybe_set_upstream_done(true);
                     }
                     // TODO: consider just drain this if serve_from_cache is set
@@ -458,9 +483,17 @@ where
                         }
 
                         // set to downstream
+                        let upgraded = session.was_upgraded();
                         let response_done = session.write_response_tasks(filtered_tasks).await?;
+                        if !upgraded && session.was_upgraded() && downstream_state.can_poll() {
+                            // just upgraded, the downstream state should be reset to continue to
+                            // poll body
+                            trace!("reset downstream state on upgrade");
+                            downstream_state.reset();
+                        }
                         response_state.maybe_set_upstream_done(response_done);
-                        // unsuccessful upgrade response may force the request done
+                        // unsuccessful upgrade response (or end of upstream upgraded conn,
+                        // which forces the body reader to complete) may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
                     } else {
                         debug!("empty upstream event");
@@ -468,7 +501,7 @@ where
                     }
                 },
 
-                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
 
                     let task = self.h1_response_filter(session, task?, ctx,
@@ -487,6 +520,9 @@ where
                                 e,
                                 self.inner.request_summary(session, ctx)
                             );
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session regardless
+                            session.downstream_session.on_proxy_failure(e);
                             continue;
                         } else {
                             return Err(e);
@@ -538,6 +574,14 @@ where
                 else => {
                     break;
                 }
+            }
+        }
+
+        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                custom_session
+                    .restore_custom_message_reader(downstream_custom_message_reader)
+                    .expect("downstream restore_custom_message_reader should be empty");
             }
         }
 
@@ -629,6 +673,10 @@ where
                     }
                 }
 
+                // TODO: just set version to Version::HTTP_11 unconditionally here,
+                // (with another todo being an option to faithfully proxy the <1.1 responses)
+                // as we are already trying to mutate this for HTTP/1.1 downstream reuse
+
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */
                 // these status codes / method cannot have body, so no need to add chunked encoding
@@ -672,6 +720,24 @@ where
 
                 Ok(HttpTask::Body(data, end))
             }
+            HttpTask::UpgradedBody(mut data, end) => {
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
+                // range doesn't apply to upgraded body
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
+                    trace!("delaying downstream upgraded response for {:?}", duration);
+                    time::sleep(duration).await;
+                }
+
+                Ok(HttpTask::UpgradedBody(data, end))
+            }
             HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // TODO: support trailers for h1
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
@@ -712,6 +778,8 @@ where
             .request_body_filter(&mut data, end_of_body)
             .await?;
 
+        // TODO: request body filter to have info about upgraded status?
+        // (can also check session.was_upgraded())
         self.inner
             .request_body_filter(session, &mut data, end_of_body, ctx)
             .await?;
@@ -732,7 +800,12 @@ where
             data.as_ref().map_or(-1, |d| d.len() as isize)
         );
 
-        tx.send(HttpTask::Body(data, upstream_end_of_body));
+        // upgraded body needs to be marked
+        if session.was_upgraded() {
+            tx.send(HttpTask::UpgradedBody(data, upstream_end_of_body));
+        } else {
+            tx.send(HttpTask::Body(data, upstream_end_of_body));
+        }
 
         Ok(end_of_body)
     }
@@ -765,15 +838,49 @@ pub(crate) async fn send_body_to1(
                     }
                 }
             }
+            HttpTask::UpgradedBody(data, end) => {
+                client_session.maybe_upgrade_body_writer();
+
+                body_done = end;
+                if let Some(d) = data {
+                    let m = client_session.write_body(&d).await;
+                    match m {
+                        Ok(m) => {
+                            match m {
+                                Some(n) => {
+                                    debug!("Write {} bytes upgraded body to upstream", n);
+                                }
+                                None => {
+                                    warn!("Upstream upgraded body is already finished. Nothing to write");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return e.into_up().into_err();
+                        }
+                    }
+                }
+            }
             _ => {
                 // should never happen, sender only sends body
                 warn!("Unexpected task sent to upstream");
                 body_done = true;
+                // error here,
+                // for client sessions that received upgrade but didn't
+                // receive any UpgradedBody,
+                // no more data is arriving so we should consider this
+                // as downstream finalizing its upgrade payload
+                client_session.maybe_upgrade_body_writer();
             }
         }
     } else {
         // sender dropped
         body_done = true;
+        // for client sessions that received upgrade but didn't
+        // receive any UpgradedBody,
+        // no more data is arriving so we should consider this
+        // as downstream finalizing its upgrade payload
+        client_session.maybe_upgrade_body_writer();
     }
 
     if body_done {

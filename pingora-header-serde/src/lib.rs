@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -220,6 +220,7 @@ fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
 #[inline]
 fn parsed_to_header(parsed: &httparse::Response) -> Result<ResponseHeader> {
     // code should always be there
+    // TODO: allow reading the parsed http version?
     let mut resp = ResponseHeader::build(parsed.code.unwrap(), Some(parsed.headers.len()))?;
 
     for header in parsed.headers.iter() {
