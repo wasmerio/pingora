@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,6 +40,12 @@ pub mod noop_tls;
 
 #[cfg(not(feature = "any_tls"))]
 pub use noop_tls::*;
+
+/// Containing type for a user callback to generate extensions for the `SslDigest` upon handshake
+/// completion.
+pub type HandshakeCompleteHook = std::sync::Arc<
+    dyn Fn(&TlsRef) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> + Send + Sync,
+>;
 
 /// The protocol for Application-Layer Protocol Negotiation
 #[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
@@ -184,6 +190,7 @@ impl ALPN {
             ALPN::H1 => vec![b"http/1.1".to_vec()],
             ALPN::H2 => vec![b"h2".to_vec()],
             ALPN::H2H1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ALPN::Custom(custom) => vec![custom.protocol().to_vec()],
         }
     }
 }

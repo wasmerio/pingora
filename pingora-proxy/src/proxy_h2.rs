@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -199,19 +199,28 @@ where
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            match custom_session.restore_custom_message_writer(
-                downstream_custom_message_writer.expect("downstream be present"),
-            ) {
-                Ok(_) => { /* continue */ }
-                Err(e) => {
-                    return (false, Some(e));
+            if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
+                match custom_session.restore_custom_message_writer(downstream_custom_message_writer)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, Some(e));
+                    }
                 }
             }
         }
 
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
-            Err(e) => (false, Some(e)),
+            Err(e) => {
+                // On application level upstream read timeouts, send RST_STREAM CANCEL,
+                // we know we have not received END_STREAM at this point since we read timed out
+                // TODO: implement for write timeouts?
+                if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                    client_body.send_reset(h2::Reason::CANCEL);
+                }
+                (false, Some(e))
+            }
         }
     }
 
@@ -243,6 +252,12 @@ where
         let (server_session_reuse, error) = self
             .proxy_down_to_up(session, client_session, peer, ctx)
             .await;
+
+        // Record upstream response body bytes received (HTTP/2 DATA payload).
+        let upstream_bytes_total = client_session.body_bytes_received();
+        session.set_upstream_body_bytes_received(upstream_bytes_total);
+
+        // Note: upstream_write_pending_time is not tracked for HTTP/2 (multiplexed streams).
 
         (server_session_reuse, error)
     }
@@ -325,6 +340,7 @@ where
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
+            let upgraded = session.was_upgraded();
 
             // Similar logic in h1 need to reserve capacity first to avoid deadlock
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
@@ -345,6 +361,9 @@ where
                                     e,
                                     self.inner.request_summary(session, ctx)
                                 );
+                                // This will not be treated as a final error, but we should signal to
+                                // downstream session regardless
+                                session.downstream_session.on_proxy_failure(e);
                                 continue;
                            } else {
                                 return Err(e.into_down());
@@ -417,6 +436,11 @@ where
                         }
 
                         let response_done = session.write_response_tasks(filtered_tasks).await?;
+                        if session.was_upgraded() {
+                            // it is very weird if the downstream session decides to upgrade
+                            // since the client h2 session cannot, return an error on this case
+                            return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
+                        }
                         response_state.maybe_set_upstream_done(response_done);
                     } else {
                         debug!("empty upstream event");
@@ -424,7 +448,7 @@ where
                     }
                 }
 
-                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
@@ -442,6 +466,9 @@ where
                                 e,
                                 self.inner.request_summary(session, ctx)
                             );
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session regardless
+                            session.downstream_session.on_proxy_failure(e);
                             continue;
                         } else {
                             return Err(e);
@@ -493,6 +520,14 @@ where
                 else => {
                     break;
                 }
+            }
+        }
+
+        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                custom_session
+                    .restore_custom_message_reader(downstream_custom_message_reader)
+                    .expect("downstream restore_custom_message_reader should be empty");
             }
         }
 
@@ -619,6 +654,11 @@ where
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
+            }
+            HttpTask::UpgradedBody(..) => {
+                // An h2 session should not be able to send an h2 upgraded response body,
+                // and logically that is impossible unless there is a bug in the client v2 session
+                panic!("Unexpected UpgradedBody task while proxy h2");
             }
             HttpTask::Trailer(mut trailers) => {
                 let trailer_buffer = match trailers.as_mut() {

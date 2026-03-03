@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@ pub use case_header_name::IntoCaseHeaderName;
 
 pub mod prelude {
     pub use crate::RequestHeader;
+    pub use crate::ResponseHeader;
 }
 
 /* an ordered header map to store the original case of each header name

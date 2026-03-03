@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -103,7 +103,7 @@ where
     pub fn new(shard_capacity: usize) -> Self {
         use std::num::NonZeroUsize;
         // safe, 1 != 0
-        const ONE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
+        const ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
         let mut cache = ConcurrentLruCache {
             lrus: Default::default(),
         };

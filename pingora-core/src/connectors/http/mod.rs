@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -89,7 +89,10 @@ where
                 }
                 // Negotiated ALPN is not custom, create a new H1 session
                 Connection::Stream(s) => {
-                    return Ok((HttpSession::H1(Http1Session::new(s)), false));
+                    return Ok((
+                        HttpSession::H1(Http1Session::new_with_options(s, peer)),
+                        false,
+                    ));
                 }
             }
         }
@@ -100,7 +103,7 @@ where
         // We assume no peer option == no ALPN == h1 only
         let h1_only = peer
             .get_peer_options()
-            .map_or(true, |o| o.alpn.get_max_http_version() == 1);
+            .is_none_or(|o| o.alpn.get_max_http_version() == 1);
         if h1_only {
             let (h1, reused) = self.h1.get_http_session(peer).await?;
             Ok((HttpSession::H1(h1), reused))

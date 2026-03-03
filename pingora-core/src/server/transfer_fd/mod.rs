@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 use log::{debug, error, warn};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
+use nix::errno::Errno::EIO;
+#[cfg(target_os = "linux")]
 use nix::sys::socket::{
     self, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag,
     SockType, UnixAddr,
@@ -24,7 +26,7 @@ use nix::sys::socket::{
 use nix::sys::stat;
 #[cfg(target_os = "linux")]
 use nix::unistd::{read, write};
-use nix::{errno::Errno::EIO, Error, NixPath};
+use nix::{Error, NixPath};
 use std::collections::HashMap;
 use std::io::Write;
 #[cfg(target_os = "linux")]
@@ -82,7 +84,7 @@ impl Fds {
         let (vec_key, vec_fds) = self.serialize();
         let mut ser_buf: [u8; 2048] = [0; 2048];
         let ser_key_size = serialize_vec_string(&vec_key, &mut ser_buf);
-        send_fds_to(vec_fds, &ser_buf[..ser_key_size], path)
+        send_fds_to(vec_fds, &ser_buf[..ser_key_size], path, None)
     }
 
     pub fn get_from_sock<P>(&mut self, path: &P) -> Result<(), Error>
@@ -90,7 +92,7 @@ impl Fds {
         P: ?Sized + NixPath + std::fmt::Display,
     {
         let mut de_buf: [u8; 2048] = [0; 2048];
-        let (fds, bytes) = get_fds_from(path, &mut de_buf)?;
+        let (fds, bytes) = get_fds_from(path, &mut de_buf, None)?;
         let keys = deserialize_vec_string(&de_buf[..bytes])?;
         self.deserialize(keys, fds);
         Ok(())
@@ -111,10 +113,15 @@ fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn get_fds_from<P>(path: &P, payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error>
+pub fn get_fds_from<P>(
+    path: &P,
+    payload: &mut [u8],
+    max_retry: Option<usize>,
+) -> Result<(Vec<RawFd>, usize), Error>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
+    let max_retry = max_retry.unwrap_or(MAX_RETRY);
     let listen_fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -136,18 +143,18 @@ where
     };
     socket::bind(listen_fd, &unix_addr).unwrap();
 
-    /* sock is created before we change user, need to give permission to all */
+    /* sock is created before we change user, need to give permission */
     stat::fchmodat(
         None,
         path,
-        stat::Mode::all(),
+        stat::Mode::from_bits_truncate(0o666),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();
 
     socket::listen(listen_fd, 8).unwrap();
 
-    let fd = match accept_with_retry(listen_fd) {
+    let fd = match accept_with_retry_timeout(listen_fd, max_retry) {
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
@@ -204,7 +211,11 @@ where
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn get_fds_from<P>(_path: &P, _payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error>
+pub fn get_fds_from<P>(
+    _path: &P,
+    _payload: &mut [u8],
+    _max_retry: Option<usize>,
+) -> Result<(Vec<RawFd>, usize), Error>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
@@ -222,13 +233,13 @@ const NONBLOCKING_POLL_INTERVAL: time::Duration = time::Duration::from_millis(50
 const MAX_NONBLOCKING_POLLS: usize = 20;
 
 #[cfg(target_os = "linux")]
-fn accept_with_retry(listen_fd: i32) -> Result<i32, Error> {
+fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Error> {
     let mut retried = 0;
     loop {
         match socket::accept(listen_fd) {
             Ok(fd) => return Ok(fd),
             Err(e) => {
-                if retried > MAX_RETRY {
+                if retried > max_retry {
                     return Err(e);
                 }
                 match e {
@@ -273,7 +284,7 @@ fn read_exact_retry(fd: RawFd, mut buf: &mut [u8]) -> Result<(), Error> {
     let mut nonblocking_polls = 0;
     while !buf.is_empty() {
         match read(fd, buf) {
-            Ok(0) => return Err(EIO.into()),
+            Ok(0) => return Err(EIO),
             Ok(n) => {
                 let tmp = buf;
                 buf = &mut tmp[n..];
@@ -326,12 +337,12 @@ fn receive_v2(
         match socket::recvmsg::<UnixAddr>(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()) {
             Ok(msg) => {
                 if msg.bytes == 0 {
-                    return Err(EIO.into());
+                    return Err(EIO);
                 }
                 if msg.flags.contains(MsgFlags::MSG_CTRUNC)
                     || msg.flags.contains(MsgFlags::MSG_TRUNC)
                 {
-                    return Err(EIO.into());
+                    return Err(EIO);
                 }
                 for cmsg in msg.cmsgs() {
                     if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
@@ -354,7 +365,7 @@ fn receive_v2(
         for fd in fds {
             let _ = nix::unistd::close(fd);
         }
-        return Err(EIO.into());
+        return Err(EIO);
     }
 
     Ok((fds, payload_len))
@@ -365,7 +376,7 @@ fn write_all_retry(fd: RawFd, mut buf: &[u8], max_nonblocking_polls: usize) -> R
     let mut polls = 0;
     while !buf.is_empty() {
         match write(fd, buf) {
-            Ok(0) => return Err(EIO.into()),
+            Ok(0) => return Err(EIO),
             Ok(n) => buf = &buf[n..],
             Err(Errno::EAGAIN) => {
                 polls += 1;
@@ -381,10 +392,16 @@ fn write_all_retry(fd: RawFd, mut buf: &[u8], max_nonblocking_polls: usize) -> R
 }
 
 #[cfg(target_os = "linux")]
-pub fn send_fds_to<P>(fds: Vec<RawFd>, payload: &[u8], path: &P) -> Result<usize, Error>
+pub fn send_fds_to<P>(
+    fds: Vec<RawFd>,
+    payload: &[u8],
+    path: &P,
+    max_retry: Option<usize>,
+) -> Result<usize, Error>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
+    let max_retry = max_retry.unwrap_or(MAX_RETRY);
     let send_fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -406,10 +423,10 @@ where
                 Errno::ENOENT | Errno::ECONNREFUSED | Errno::EACCES => {
                     /*the server is not ready yet*/
                     retried += 1;
-                    if retried > MAX_RETRY {
+                    if retried > max_retry {
                         error!(
                             "Max retry: {} reached. Giving up sending socket to: {}, error: {:?}",
-                            MAX_RETRY, path, e
+                            max_retry, path, e
                         );
                         break Err(e);
                     }
@@ -514,7 +531,12 @@ where
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn send_fds_to<P>(_fds: Vec<RawFd>, _payload: &[u8], _path: &P) -> Result<usize, Error>
+pub fn send_fds_to<P>(
+    _fds: Vec<RawFd>,
+    _payload: &[u8],
+    _path: &P,
+    _max_retry: Option<usize>,
+) -> Result<usize, Error>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
@@ -583,7 +605,8 @@ mod tests {
         // receiver need to start in another thread since it is blocking
         let child = thread::spawn(move || {
             let mut buf: [u8; 64] = [0; 64];
-            let (fds, bytes) = get_fds_from("/tmp/pingora_fds_receive.sock", &mut buf).unwrap();
+            let (fds, bytes) =
+                get_fds_from("/tmp/pingora_fds_receive.sock", &mut buf, None).unwrap();
             debug!("{:?}", fds);
             assert_eq!(1, fds.len());
             assert_eq!(32, bytes);
@@ -593,7 +616,7 @@ mod tests {
 
         let fds = vec![dumb_fd];
         let buf: [u8; 32] = [1; 32];
-        match send_fds_to(fds, &buf, "/tmp/pingora_fds_receive.sock") {
+        match send_fds_to(fds, &buf, "/tmp/pingora_fds_receive.sock", None) {
             Ok(sent) => {
                 assert!(sent > 0);
             }
@@ -642,6 +665,69 @@ mod tests {
     }
 
     #[test]
+    fn test_send_fds_to_respects_configurable_timeout() {
+        init_log();
+        use std::time::Instant;
+
+        let dumb_fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+
+        let fds = vec![dumb_fd];
+        let buf: [u8; 32] = [1; 32];
+
+        // Try to send with a custom max_retries of 2
+        let start = Instant::now();
+        let result = send_fds_to(fds, &buf, "/tmp/pingora_test_config_send.sock", Some(2));
+        let elapsed = start.elapsed();
+
+        // Should fail after 2 retries with RETRY_INTERVAL (1 second) between each
+        // Total time should be approximately 2 seconds
+        assert!(result.is_err());
+        assert!(
+            elapsed.as_secs() >= 2,
+            "Expected at least 2 seconds, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs() < 4,
+            "Expected less than 4 seconds, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_get_fds_from_respects_configurable_timeout() {
+        init_log();
+        use std::time::Instant;
+
+        let mut buf: [u8; 32] = [0; 32];
+
+        // Try to receive with a custom max_retries of 2
+        let start = Instant::now();
+        let result = get_fds_from("/tmp/pingora_test_config_receive.sock", &mut buf, Some(2));
+        let elapsed = start.elapsed();
+
+        // Should fail after 2 retries with RETRY_INTERVAL (1 second) between each
+        // Total time should be approximately 2 seconds
+        assert!(result.is_err());
+        assert!(
+            elapsed.as_secs() >= 2,
+            "Expected at least 2 seconds, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs() < 4,
+            "Expected less than 4 seconds, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
     fn test_v1_compatibility() {
         init_log();
         let dumb_fd = socket::socket(
@@ -655,7 +741,8 @@ mod tests {
         // receiver thread uses legacy path (v1)
         let child = thread::spawn(move || {
             let mut buf: [u8; 64] = [0; 64];
-            let (fds, bytes) = get_fds_from("/tmp/pingora_fds_receive_v1.sock", &mut buf).unwrap();
+            let (fds, bytes) =
+                get_fds_from("/tmp/pingora_fds_receive_v1.sock", &mut buf, None).unwrap();
             assert_eq!(1, fds.len());
             assert_eq!(16, bytes);
             assert_eq!(7, buf[0]);
@@ -687,14 +774,14 @@ mod tests {
         let child = thread::spawn(move || {
             let mut buf: [u8; 64] = [0; 64];
             let (recv_fds, bytes) =
-                get_fds_from("/tmp/pingora_fds_receive_v2.sock", &mut buf).unwrap();
+                get_fds_from("/tmp/pingora_fds_receive_v2.sock", &mut buf, None).unwrap();
             assert_eq!(40, recv_fds.len());
             assert_eq!(payload.len(), bytes);
             assert_eq!(9, buf[0]);
             assert_eq!(9, buf[payload.len() - 1]);
         });
 
-        send_fds_to(fds, &payload, "/tmp/pingora_fds_receive_v2.sock").unwrap();
+        send_fds_to(fds, &payload, "/tmp/pingora_fds_receive_v2.sock", None).unwrap();
         child.join().unwrap();
     }
 
