@@ -284,7 +284,7 @@ fn read_exact_retry(fd: RawFd, mut buf: &mut [u8]) -> Result<(), Error> {
     let mut nonblocking_polls = 0;
     while !buf.is_empty() {
         match read(fd, buf) {
-            Ok(0) => return Err(EIO.into()),
+            Ok(0) => return Err(EIO),
             Ok(n) => {
                 let tmp = buf;
                 buf = &mut tmp[n..];
@@ -337,12 +337,12 @@ fn receive_v2(
         match socket::recvmsg::<UnixAddr>(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()) {
             Ok(msg) => {
                 if msg.bytes == 0 {
-                    return Err(EIO.into());
+                    return Err(EIO);
                 }
                 if msg.flags.contains(MsgFlags::MSG_CTRUNC)
                     || msg.flags.contains(MsgFlags::MSG_TRUNC)
                 {
-                    return Err(EIO.into());
+                    return Err(EIO);
                 }
                 for cmsg in msg.cmsgs() {
                     if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
@@ -365,7 +365,7 @@ fn receive_v2(
         for fd in fds {
             let _ = nix::unistd::close(fd);
         }
-        return Err(EIO.into());
+        return Err(EIO);
     }
 
     Ok((fds, payload_len))
@@ -376,7 +376,7 @@ fn write_all_retry(fd: RawFd, mut buf: &[u8], max_nonblocking_polls: usize) -> R
     let mut polls = 0;
     while !buf.is_empty() {
         match write(fd, buf) {
-            Ok(0) => return Err(EIO.into()),
+            Ok(0) => return Err(EIO),
             Ok(n) => buf = &buf[n..],
             Err(Errno::EAGAIN) => {
                 polls += 1;
