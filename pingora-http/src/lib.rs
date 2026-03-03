@@ -23,7 +23,7 @@
 #![allow(clippy::new_without_default)]
 
 use bytes::BufMut;
-use http::header::{AsHeaderName, HeaderName, HeaderValue};
+use http::header::{self, AsHeaderName, HeaderName, HeaderValue};
 use http::request::Builder as ReqBuilder;
 use http::request::Parts as ReqParts;
 use http::response::Builder as RespBuilder;
@@ -730,9 +730,33 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
             buf.put_slice(CRLF);
         });
     } else {
+        let mut cookie_written = false;
         for (header, value) in value_map {
             let titled_header =
                 case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
+
+            // Converting HTTP/2 to HTTP/1 RFC 9113 §8.1.2.5 specifies that
+            // multiple Cookie headers should be concated together with ';'
+            if header == header::COOKIE {
+                if cookie_written {
+                    continue;
+                }
+                cookie_written = true;
+
+                let mut iter = value_map.get_all(header).iter();
+                if let Some(first) = iter.next() {
+                    let mut combined = Vec::from(first.as_bytes());
+                    for v in iter {
+                        combined.extend_from_slice(b"; ");
+                        combined.extend_from_slice(v.as_bytes());
+                    }
+                    buf.put_slice(titled_header.as_bytes());
+                    buf.put_slice(HEADER_KV_DELIMITER);
+                    buf.put_slice(&combined);
+                    buf.put_slice(CRLF);
+                }
+                continue;
+            }
             buf.put_slice(titled_header.as_bytes());
             buf.put_slice(HEADER_KV_DELIMITER);
             buf.put_slice(value.as_ref());
@@ -829,6 +853,17 @@ mod tests {
         resp.case_header_iter().for_each(|(_, _)| {
             unreachable!("response has no case");
         });
+    }
+
+    #[test]
+    fn test_cookie_headers_join_with_semicolon() {
+        let mut req = RequestHeader::new_no_case(None);
+        req.append_header(http::header::COOKIE, "A=1").unwrap();
+        req.append_header(http::header::COOKIE, "B=2").unwrap();
+
+        let mut buf: Vec<u8> = vec![];
+        req.header_to_h1_wire(&mut buf);
+        assert_eq!(buf, b"cookie: A=1; B=2\r\n");
     }
 
     #[test]

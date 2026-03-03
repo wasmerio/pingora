@@ -16,9 +16,16 @@
 use log::{debug, error, warn};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{self, AddressFamily, RecvMsg, SockFlag, SockType, UnixAddr};
+use nix::errno::Errno::EIO;
+#[cfg(target_os = "linux")]
+use nix::sys::socket::{
+    self, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag,
+    SockType, UnixAddr,
+};
 #[cfg(target_os = "linux")]
 use nix::sys::stat;
+#[cfg(target_os = "linux")]
+use nix::unistd::{read, write};
 use nix::{Error, NixPath};
 use std::collections::HashMap;
 use std::io::Write;
@@ -34,6 +41,15 @@ use std::{thread, time};
 pub struct Fds {
     map: HashMap<String, RawFd>,
 }
+
+#[cfg(target_os = "linux")]
+const MAGIC_PREFIX: [u8; 8] = [0, b'P', b'I', b'N', b'G', b'F', b'D', b'2'];
+#[cfg(target_os = "linux")]
+const V2_HEADER_LEN: usize = MAGIC_PREFIX.len() + 8; // magic + fd_count + payload_len
+#[cfg(target_os = "linux")]
+const V2_MAX_FD_CHUNK: usize = 32;
+#[cfg(target_os = "linux")]
+const MAX_FDS_V1: usize = 32;
 
 impl Fds {
     pub fn new() -> Self {
@@ -106,8 +122,6 @@ where
     P: ?Sized + NixPath + std::fmt::Display,
 {
     let max_retry = max_retry.unwrap_or(MAX_RETRY);
-    const MAX_FDS: usize = 32;
-
     let listen_fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -152,31 +166,48 @@ where
         }
     };
 
-    let mut io_vec = [IoSliceMut::new(payload); 1];
-    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
-    let msg: RecvMsg<UnixAddr> = socket::recvmsg(
-        fd,
-        &mut io_vec,
-        Some(&mut cmsg_buf),
-        socket::MsgFlags::empty(),
-    )
-    .unwrap();
-
-    let mut fds: Vec<RawFd> = Vec::new();
-    for cmsg in msg.cmsgs() {
-        if let socket::ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
-            fds.append(&mut vec_fds)
-        } else {
-            warn!("Unexpected control messages: {cmsg:?}")
+    // Decide protocol version by peeking at the magic prefix.
+    let mut prefix_buf = [0u8; MAGIC_PREFIX.len()];
+    let mut peek_polls = 0;
+    let is_v2 = loop {
+        match socket::recv(fd, &mut prefix_buf, MsgFlags::MSG_PEEK) {
+            Ok(0) => break false,
+            Ok(n) => {
+                if n < MAGIC_PREFIX.len() {
+                    peek_polls += 1;
+                    if peek_polls >= MAX_NONBLOCKING_POLLS {
+                        break false;
+                    }
+                    thread::sleep(NONBLOCKING_POLL_INTERVAL);
+                    continue;
+                }
+                break prefix_buf == MAGIC_PREFIX;
+            }
+            Err(Errno::EAGAIN) => {
+                peek_polls += 1;
+                if peek_polls >= MAX_NONBLOCKING_POLLS {
+                    break false;
+                }
+                thread::sleep(NONBLOCKING_POLL_INTERVAL);
+            }
+            Err(_) => break false,
         }
-    }
+    };
+
+    let (fds, bytes) = if is_v2 {
+        receive_v2(fd, payload, &MAGIC_PREFIX, V2_HEADER_LEN)?
+    } else {
+        receive_v1(fd, payload)?
+    };
+
+    let _ = nix::unistd::close(fd);
 
     //cleanup
     if nix::unistd::close(listen_fd).is_ok() {
         nix::unistd::unlink(path).unwrap();
     }
 
-    Ok((fds, msg.bytes))
+    Ok((fds, bytes))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -196,6 +227,10 @@ where
 const MAX_RETRY: usize = 5;
 #[cfg(target_os = "linux")]
 const RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const NONBLOCKING_POLL_INTERVAL: time::Duration = time::Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const MAX_NONBLOCKING_POLLS: usize = 20;
 
 #[cfg(target_os = "linux")]
 fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Error> {
@@ -226,6 +261,137 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
 }
 
 #[cfg(target_os = "linux")]
+fn receive_v1(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error> {
+    let mut io_vec = [IoSliceMut::new(payload); 1];
+    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS_V1]);
+    let msg: RecvMsg<UnixAddr> =
+        socket::recvmsg(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()).unwrap();
+
+    let mut fds: Vec<RawFd> = Vec::new();
+    for cmsg in msg.cmsgs() {
+        if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
+            fds.append(&mut vec_fds)
+        } else {
+            warn!("Unexpected control messages: {cmsg:?}")
+        }
+    }
+
+    Ok((fds, msg.bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn read_exact_retry(fd: RawFd, mut buf: &mut [u8]) -> Result<(), Error> {
+    let mut nonblocking_polls = 0;
+    while !buf.is_empty() {
+        match read(fd, buf) {
+            Ok(0) => return Err(EIO.into()),
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+            }
+            Err(Errno::EAGAIN) => {
+                nonblocking_polls += 1;
+                if nonblocking_polls >= MAX_NONBLOCKING_POLLS {
+                    return Err(Errno::EAGAIN);
+                }
+                thread::sleep(NONBLOCKING_POLL_INTERVAL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn receive_v2(
+    fd: RawFd,
+    payload: &mut [u8],
+    magic: &[u8],
+    header_len: usize,
+) -> Result<(Vec<RawFd>, usize), Error> {
+    let mut header = vec![0u8; header_len];
+    read_exact_retry(fd, &mut header)?;
+    if header[..magic.len()] != *magic {
+        return Err(Error::EINVAL);
+    }
+
+    let fd_count =
+        u32::from_be_bytes(header[magic.len()..magic.len() + 4].try_into().unwrap()) as usize;
+    let payload_len =
+        u32::from_be_bytes(header[magic.len() + 4..magic.len() + 8].try_into().unwrap()) as usize;
+
+    if payload_len > payload.len() {
+        return Err(Error::EINVAL);
+    }
+
+    read_exact_retry(fd, &mut payload[..payload_len])?;
+
+    let mut fds: Vec<RawFd> = Vec::with_capacity(fd_count);
+    let mut nonblocking_polls = 0;
+
+    while fds.len() < fd_count {
+        let mut data = [0u8; 1];
+        let mut io_vec = [IoSliceMut::new(&mut data)];
+        let mut cmsg_buf = nix::cmsg_space!([RawFd; V2_MAX_FD_CHUNK]);
+
+        match socket::recvmsg::<UnixAddr>(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()) {
+            Ok(msg) => {
+                if msg.bytes == 0 {
+                    return Err(EIO.into());
+                }
+                if msg.flags.contains(MsgFlags::MSG_CTRUNC)
+                    || msg.flags.contains(MsgFlags::MSG_TRUNC)
+                {
+                    return Err(EIO.into());
+                }
+                for cmsg in msg.cmsgs() {
+                    if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
+                        fds.append(&mut vec_fds)
+                    }
+                }
+            }
+            Err(Errno::EAGAIN) => {
+                nonblocking_polls += 1;
+                if nonblocking_polls >= MAX_NONBLOCKING_POLLS {
+                    return Err(Errno::EAGAIN);
+                }
+                thread::sleep(NONBLOCKING_POLL_INTERVAL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if fds.len() != fd_count {
+        for fd in fds {
+            let _ = nix::unistd::close(fd);
+        }
+        return Err(EIO.into());
+    }
+
+    Ok((fds, payload_len))
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_retry(fd: RawFd, mut buf: &[u8], max_nonblocking_polls: usize) -> Result<(), Error> {
+    let mut polls = 0;
+    while !buf.is_empty() {
+        match write(fd, buf) {
+            Ok(0) => return Err(EIO.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(Errno::EAGAIN) => {
+                polls += 1;
+                if polls >= max_nonblocking_polls {
+                    return Err(Errno::EAGAIN);
+                }
+                thread::sleep(NONBLOCKING_POLL_INTERVAL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub fn send_fds_to<P>(
     fds: Vec<RawFd>,
     payload: &[u8],
@@ -236,9 +402,6 @@ where
     P: ?Sized + NixPath + std::fmt::Display,
 {
     let max_retry = max_retry.unwrap_or(MAX_RETRY);
-    const MAX_NONBLOCKING_POLLS: usize = 20;
-    const NONBLOCKING_POLL_INTERVAL: time::Duration = time::Duration::from_millis(500);
-
     let send_fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -290,39 +453,75 @@ where
 
     let result = match conn_result {
         Ok(_) => {
-            let io_vec = [IoSlice::new(payload); 1];
-            let scm = socket::ControlMessage::ScmRights(fds.as_slice());
-            let cmsg = [scm; 1];
-            loop {
-                match socket::sendmsg(
-                    send_fd,
-                    &io_vec,
-                    &cmsg,
-                    socket::MsgFlags::empty(),
-                    None::<&UnixAddr>,
-                ) {
-                    Ok(result) => break Ok(result),
-                    Err(e) => match e {
-                        /* handle nonblocking IO */
-                        Errno::EAGAIN => {
-                            nonblocking_polls += 1;
-                            if nonblocking_polls >= MAX_NONBLOCKING_POLLS {
-                                error!(
-                                    "Sendmsg() not ready after retries when sending socket to: {}",
-                                    path
-                                );
-                                break Err(e);
-                            }
-                            warn!(
-                                "Sendmsg() not ready, will try again in {:?}",
-                                NONBLOCKING_POLL_INTERVAL
-                            );
-                            thread::sleep(NONBLOCKING_POLL_INTERVAL);
+            // V2 framing: magic + fd_count + payload_len, then payload bytes, then FD chunks.
+            let header_len = MAGIC_PREFIX.len() + 8;
+            let mut header = vec![0u8; header_len];
+            header[..MAGIC_PREFIX.len()].copy_from_slice(&MAGIC_PREFIX);
+            header[MAGIC_PREFIX.len()..MAGIC_PREFIX.len() + 4]
+                .copy_from_slice(&(fds.len() as u32).to_be_bytes());
+            header[MAGIC_PREFIX.len() + 4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+
+            let mut result: Result<usize, Error> = Ok(0);
+            'send: {
+                if let Err(e) = write_all_retry(send_fd, &header, MAX_NONBLOCKING_POLLS) {
+                    result = Err(e);
+                    break 'send;
+                }
+                if let Err(e) = write_all_retry(send_fd, payload, MAX_NONBLOCKING_POLLS) {
+                    result = Err(e);
+                    break 'send;
+                }
+
+                // Send FDs in bounded chunks to avoid ancillary truncation.
+                let mut sent_fds = 0;
+                while sent_fds < fds.len() {
+                    let end = usize::min(sent_fds + V2_MAX_FD_CHUNK, fds.len());
+                    let scm = ControlMessage::ScmRights(&fds[sent_fds..end]);
+                    let cmsg = [scm; 1];
+                    let data = [0xFFu8; 1];
+                    let io_vec = [IoSlice::new(&data)];
+
+                    loop {
+                        match socket::sendmsg(
+                            send_fd,
+                            &io_vec,
+                            &cmsg,
+                            socket::MsgFlags::empty(),
+                            None::<&UnixAddr>,
+                        ) {
+                            Ok(_) => break,
+                            Err(e) => match e {
+                                /* handle nonblocking IO */
+                                Errno::EAGAIN => {
+                                    nonblocking_polls += 1;
+                                    if nonblocking_polls >= MAX_NONBLOCKING_POLLS {
+                                        error!("Sendmsg() not ready after retries when sending socket to: {}", path);
+                                        result = Err(e);
+                                        break 'send;
+                                    }
+                                    warn!(
+                                        "Sendmsg() not ready, will try again in {:?}",
+                                        NONBLOCKING_POLL_INTERVAL
+                                    );
+                                    thread::sleep(NONBLOCKING_POLL_INTERVAL);
+                                }
+                                _ => {
+                                    result = Err(e);
+                                    break 'send;
+                                }
+                            },
                         }
-                        _ => break Err(e),
-                    },
+                    }
+
+                    sent_fds = end;
+                }
+
+                if result.is_ok() {
+                    result = Ok(header.len() + payload.len());
                 }
             }
+
+            result
         }
         Err(_) => conn_result,
     };
@@ -405,7 +604,7 @@ mod tests {
 
         // receiver need to start in another thread since it is blocking
         let child = thread::spawn(move || {
-            let mut buf: [u8; 32] = [0; 32];
+            let mut buf: [u8; 64] = [0; 64];
             let (fds, bytes) =
                 get_fds_from("/tmp/pingora_fds_receive.sock", &mut buf, None).unwrap();
             debug!("{:?}", fds);
@@ -416,7 +615,7 @@ mod tests {
         });
 
         let fds = vec![dumb_fd];
-        let buf: [u8; 128] = [1; 128];
+        let buf: [u8; 32] = [1; 32];
         match send_fds_to(fds, &buf, "/tmp/pingora_fds_receive.sock", None) {
             Ok(sent) => {
                 assert!(sent > 0);
@@ -526,5 +725,106 @@ mod tests {
             "Expected less than 4 seconds, got {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn test_v1_compatibility() {
+        init_log();
+        let dumb_fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+
+        // receiver thread uses legacy path (v1)
+        let child = thread::spawn(move || {
+            let mut buf: [u8; 64] = [0; 64];
+            let (fds, bytes) =
+                get_fds_from("/tmp/pingora_fds_receive_v1.sock", &mut buf, None).unwrap();
+            assert_eq!(1, fds.len());
+            assert_eq!(16, bytes);
+            assert_eq!(7, buf[0]);
+            assert_eq!(7, buf[15]);
+        });
+
+        let payload = [7u8; 16];
+        let fds = vec![dumb_fd];
+        legacy_send_fds("/tmp/pingora_fds_receive_v1.sock", &fds, &payload).unwrap();
+        child.join().unwrap();
+    }
+
+    #[test]
+    fn test_v2_chunked_send_more_than_32() {
+        init_log();
+        let mut fds: Vec<RawFd> = Vec::new();
+        for _ in 0..40 {
+            let fd = socket::socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::empty(),
+                None,
+            )
+            .unwrap();
+            fds.push(fd);
+        }
+
+        let payload = [9u8; 24];
+        let child = thread::spawn(move || {
+            let mut buf: [u8; 64] = [0; 64];
+            let (recv_fds, bytes) =
+                get_fds_from("/tmp/pingora_fds_receive_v2.sock", &mut buf, None).unwrap();
+            assert_eq!(40, recv_fds.len());
+            assert_eq!(payload.len(), bytes);
+            assert_eq!(9, buf[0]);
+            assert_eq!(9, buf[payload.len() - 1]);
+        });
+
+        send_fds_to(fds, &payload, "/tmp/pingora_fds_receive_v2.sock", None).unwrap();
+        child.join().unwrap();
+    }
+
+    fn legacy_send_fds(path: &str, fds: &[RawFd], payload: &[u8]) -> Result<(), Error> {
+        const MAX_RETRY: usize = 5;
+        const RETRY_INTERVAL: time::Duration = time::Duration::from_millis(200);
+
+        let send_fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_NONBLOCK,
+            None,
+        )?;
+        let unix_addr = UnixAddr::new(path)?;
+        let mut retry = 0;
+        loop {
+            match socket::connect(send_fd, &unix_addr) {
+                Ok(_) => break,
+                Err(e) => match e {
+                    Errno::ENOENT | Errno::ECONNREFUSED | Errno::EACCES => {
+                        retry += 1;
+                        if retry > MAX_RETRY {
+                            return Err(e);
+                        }
+                        thread::sleep(RETRY_INTERVAL);
+                    }
+                    _ => return Err(e),
+                },
+            }
+        }
+
+        let io_vec = [IoSlice::new(payload)];
+        let scm = socket::ControlMessage::ScmRights(fds);
+        let cmsg = [scm; 1];
+        socket::sendmsg(
+            send_fd,
+            &io_vec,
+            &cmsg,
+            socket::MsgFlags::empty(),
+            None::<&UnixAddr>,
+        )?;
+
+        nix::unistd::close(send_fd).unwrap();
+        Ok(())
     }
 }
