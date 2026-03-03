@@ -797,10 +797,7 @@ impl Server {
             .into_iter()
             .map(|(rt, name)| {
                 info!("Waiting for runtimes to exit!");
-                let join = thread::spawn(move || {
-                    rt.shutdown_timeout(shutdown_timeout);
-                    thread::sleep(shutdown_timeout)
-                });
+                let join = thread::spawn(move || rt.shutdown_timeout(shutdown_timeout));
                 (join, name)
             })
             .collect();
