@@ -16,8 +16,6 @@
 use log::{debug, error, warn};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
-use nix::errno::Errno::EIO;
-#[cfg(target_os = "linux")]
 use nix::sys::socket::{
     self, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag,
     SockType, UnixAddr,
@@ -26,7 +24,7 @@ use nix::sys::socket::{
 use nix::sys::stat;
 #[cfg(target_os = "linux")]
 use nix::unistd::{read, write};
-use nix::{Error, NixPath};
+use nix::{errno::Errno::EIO, Error, NixPath};
 use std::collections::HashMap;
 use std::io::Write;
 #[cfg(target_os = "linux")]
@@ -122,6 +120,7 @@ where
     P: ?Sized + NixPath + std::fmt::Display,
 {
     let max_retry = max_retry.unwrap_or(MAX_RETRY);
+
     let listen_fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -402,6 +401,7 @@ where
     P: ?Sized + NixPath + std::fmt::Display,
 {
     let max_retry = max_retry.unwrap_or(MAX_RETRY);
+
     let send_fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -665,69 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn test_send_fds_to_respects_configurable_timeout() {
-        init_log();
-        use std::time::Instant;
-
-        let dumb_fd = socket::socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::empty(),
-            None,
-        )
-        .unwrap();
-
-        let fds = vec![dumb_fd];
-        let buf: [u8; 32] = [1; 32];
-
-        // Try to send with a custom max_retries of 2
-        let start = Instant::now();
-        let result = send_fds_to(fds, &buf, "/tmp/pingora_test_config_send.sock", Some(2));
-        let elapsed = start.elapsed();
-
-        // Should fail after 2 retries with RETRY_INTERVAL (1 second) between each
-        // Total time should be approximately 2 seconds
-        assert!(result.is_err());
-        assert!(
-            elapsed.as_secs() >= 2,
-            "Expected at least 2 seconds, got {:?}",
-            elapsed
-        );
-        assert!(
-            elapsed.as_secs() < 4,
-            "Expected less than 4 seconds, got {:?}",
-            elapsed
-        );
-    }
-
-    #[test]
-    fn test_get_fds_from_respects_configurable_timeout() {
-        init_log();
-        use std::time::Instant;
-
-        let mut buf: [u8; 32] = [0; 32];
-
-        // Try to receive with a custom max_retries of 2
-        let start = Instant::now();
-        let result = get_fds_from("/tmp/pingora_test_config_receive.sock", &mut buf, Some(2));
-        let elapsed = start.elapsed();
-
-        // Should fail after 2 retries with RETRY_INTERVAL (1 second) between each
-        // Total time should be approximately 2 seconds
-        assert!(result.is_err());
-        assert!(
-            elapsed.as_secs() >= 2,
-            "Expected at least 2 seconds, got {:?}",
-            elapsed
-        );
-        assert!(
-            elapsed.as_secs() < 4,
-            "Expected less than 4 seconds, got {:?}",
-            elapsed
-        );
-    }
-
-    #[test]
     fn test_v1_compatibility() {
         init_log();
         let dumb_fd = socket::socket(
@@ -783,6 +720,63 @@ mod tests {
 
         send_fds_to(fds, &payload, "/tmp/pingora_fds_receive_v2.sock", None).unwrap();
         child.join().unwrap();
+    }
+
+    #[test]
+    fn test_send_fds_to_respects_configurable_timeout() {
+        init_log();
+        use std::time::Instant;
+
+        let dumb_fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+
+        let fds = vec![dumb_fd];
+        let buf: [u8; 32] = [1; 32];
+
+        let start = Instant::now();
+        let result = send_fds_to(fds, &buf, "/tmp/pingora_test_config_send.sock", Some(2));
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed.as_secs() >= 2,
+            "Expected at least 2 seconds, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs() < 4,
+            "Expected less than 4 seconds, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_get_fds_from_respects_configurable_timeout() {
+        init_log();
+        use std::time::Instant;
+
+        let mut buf: [u8; 32] = [0; 32];
+
+        let start = Instant::now();
+        let result = get_fds_from("/tmp/pingora_test_config_receive.sock", &mut buf, Some(2));
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed.as_secs() >= 2,
+            "Expected at least 2 seconds, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs() < 4,
+            "Expected less than 4 seconds, got {:?}",
+            elapsed
+        );
     }
 
     fn legacy_send_fds(path: &str, fds: &[RawFd], payload: &[u8]) -> Result<(), Error> {
