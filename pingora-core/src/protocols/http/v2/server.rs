@@ -936,7 +936,7 @@ mod test {
                     .write_response_header(response_header.clone(), false)
                     .is_ok());
 
-                http.write_body(server_body.into(), false).await.unwrap();
+                http.write_body(server_body.into(), true).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
                 // 3. Waiting for the client to close stream.
