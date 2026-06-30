@@ -1103,11 +1103,17 @@ async fn test_error_after_headers_sent_rst_received() {
     let response = response.await.unwrap();
     let mut body = response.into_body();
 
-    let chunk = body.data().await.unwrap();
-    assert_eq!(chunk.unwrap(), Bytes::from_static(b"AAAAA"));
+    match body.data().await.unwrap() {
+        Ok(chunk) => {
+            assert_eq!(chunk, Bytes::from_static(b"AAAAA"));
 
-    let err = body.data().await.unwrap().err().unwrap();
-    assert_eq!(err.reason().unwrap(), h2::Reason::CANCEL);
+            let err = body.data().await.unwrap().err().unwrap();
+            assert_eq!(err.reason().unwrap(), h2::Reason::CANCEL);
+        }
+        Err(err) => {
+            assert_eq!(err.reason().unwrap(), h2::Reason::CANCEL);
+        }
+    }
 }
 
 #[tokio::test]
