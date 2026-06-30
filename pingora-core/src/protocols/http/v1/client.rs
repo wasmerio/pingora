@@ -119,7 +119,12 @@ impl HttpSession {
         // init body writer
         self.init_req_body_writer(&req);
 
-        let to_wire = http_req_header_to_wire(&req).unwrap();
+        let to_wire = http_req_header_to_wire(&req).ok_or_else(|| {
+            Error::explain(
+                InvalidHTTPHeader,
+                "request-line contains forbidden delimiter bytes or unsupported HTTP version",
+            )
+        })?;
         trace!("Writing request header: {to_wire:?}");
 
         let write_fut = self.underlying_stream.write_all(to_wire.as_ref());
@@ -323,28 +328,7 @@ impl HttpSession {
                         let header_name = header.get_name_bytes(&buf);
                         let header_name = header_name.into_case_header_name();
                         let value_bytes = header.get_value_bytes(&buf);
-                        let header_value = if cfg!(debug_assertions) {
-                            // from_maybe_shared_unchecked() in debug mode still checks whether
-                            // the header value is valid, which breaks the _obsolete_multiline
-                            // support. To work around this, in debug mode, we replace CRLF with
-                            // whitespace
-                            if let Some(p) = value_bytes.windows(CRLF.len()).position(|w| w == CRLF)
-                            {
-                                let mut new_header = Vec::from_iter(value_bytes);
-                                new_header[p] = b' ';
-                                new_header[p + 1] = b' ';
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(new_header)
-                                }
-                            } else {
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
-                                }
-                            }
-                        } else {
-                            // safe because this is from what we parsed
-                            unsafe { http::HeaderValue::from_maybe_shared_unchecked(value_bytes) }
-                        };
+                        let header_value = pingora_http::header_value_from_raw(value_bytes);
                         response_header
                             .append_header(header_name, header_value)
                             .or_err(InvalidHTTPHeader, "while parsing request header")?;
@@ -625,13 +609,6 @@ impl HttpSession {
             // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
-            if let Some(req) = self.request_written.as_ref() {
-                if req.method == http::method::Method::HEAD {
-                    self.body_reader.init_content_length(0, preread_body);
-                    return;
-                }
-            }
-
             let upgraded = if let Some(code) = self.get_status() {
                 match code.as_u16() {
                     101 => self.is_upgrade_req(),
@@ -649,6 +626,13 @@ impl HttpSession {
             } else {
                 false
             };
+
+            if let Some(req) = self.request_written.as_ref() {
+                if req.method == http::method::Method::HEAD {
+                    self.body_reader.init_content_length(0, preread_body);
+                    return;
+                }
+            }
 
             if upgraded {
                 self.body_reader.init_close_delimited(preread_body);
@@ -844,6 +828,13 @@ fn parse_resp_buffer<'buf>(
     }
 }
 
+/// Returns `true` if `path` contains a byte that must never appear in an HTTP/1.1
+/// request target: NUL (`0x00`), LF (`0x0a`), CR (`0x0d`), or SP (`0x20`).
+#[inline]
+fn request_target_has_forbidden_byte(path: &[u8]) -> bool {
+    path.iter().any(|&b| matches!(b, 0x00 | 0x0a | 0x0d | 0x20))
+}
+
 // TODO: change it to to_buf
 #[inline]
 pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
@@ -853,7 +844,12 @@ pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
     let method = req.method.as_str().as_bytes();
     buf.put_slice(method);
     buf.put_u8(b' ');
-    buf.put_slice(req.raw_path());
+
+    let path = req.raw_path();
+    if request_target_has_forbidden_byte(path) {
+        return None;
+    }
+    buf.put_slice(path);
     buf.put_u8(b' ');
 
     let version = match req.version {
@@ -1844,9 +1840,9 @@ mod tests_stream {
         }
     }
 
-    // Note: in debug mode, due to from_maybe_shared_unchecked() still tries to validate headers
-    // values, so the code has to replace CRLF with whitespaces. In release mode, the CRLF is
-    // reserved
+    // Each obs-fold (CRLF + at least one SP/HTAB) in a received header
+    // value is replaced with a single SP before the value is interpreted,
+    // via `pingora_http::header_value_from_raw`.
     #[tokio::test]
     async fn read_obsolete_multiline_headers() {
         init_log();
@@ -1859,7 +1855,7 @@ mod tests_stream {
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
         assert_eq!(
             http_stream.get_header("Server").unwrap(),
-            "pingora   Foo: Bar"
+            "pingora Foo: Bar"
         );
 
         let input = b"HTTP/1.1 200 OK\r\nServer : pingora\r\n\t  Fizz: Buzz\r\n\r\n";
@@ -1870,7 +1866,7 @@ mod tests_stream {
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
         assert_eq!(
             http_stream.get_header("Server").unwrap(),
-            "pingora  \t  Fizz: Buzz"
+            "pingora Fizz: Buzz"
         );
     }
 
@@ -2224,6 +2220,283 @@ hello";
         http_stream.respect_keepalive();
         assert!(!http_stream.will_keepalive());
     }
+
+    #[tokio::test]
+    async fn read_informational_head_request() {
+        init_log();
+        // HEAD request that receives 100 Continue followed by 200 OK
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let input2 = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .read(&input1[..])
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        // Write HEAD request
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // Read 100 Continue
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob, "100 Continue for HEAD should not signal end of body");
+            }
+            _ => {
+                panic!("task should be informational header")
+            }
+        }
+
+        // Read final 200 OK
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob, "HEAD 200 response should signal end of body");
+            }
+            _ => {
+                panic!("task should be final header")
+            }
+        }
+
+        // Body reader should be Complete(0) for HEAD
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_informational_multiple_head_request() {
+        init_log();
+        // HEAD request that receives 100 Continue, 103 Early Hints, then 200 OK
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // Read 100 Continue
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob, "100 Continue for HEAD should not signal end of body");
+            }
+            _ => {
+                panic!("task should be 100 header")
+            }
+        }
+
+        // Read 103 Early Hints
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 103);
+                assert!(
+                    !eob,
+                    "103 Early Hints for HEAD should not signal end of body"
+                );
+            }
+            _ => {
+                panic!("task should be 103 header")
+            }
+        }
+
+        // Read 200 OK — end of body
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob, "HEAD 200 response should signal end of body");
+            }
+            _ => {
+                panic!("task should be final header")
+            }
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_basic_head() {
+        init_log();
+        // Basic HEAD + 200
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob, "HEAD 200 should be end of body");
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+
+        // Keepalive should work for a properly-framed HEAD response
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn read_head_informational_keepalive() {
+        init_log();
+        // HEAD + 100 Continue + 200 OK, then verify keepalive is preserved.
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let input2 = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .read(&input1[..])
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // 100 Continue
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => panic!("task should be informational header"),
+        }
+
+        // 200 OK
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob);
+            }
+            _ => panic!("task should be final header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+
+        // Keepalive must still work after the 100 + 200 sequence
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn read_head_204() {
+        init_log();
+        // HEAD + 204 No Content
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 204 No Content\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 204);
+                assert!(eob, "HEAD 204 should be end of body");
+            }
+            _ => panic!("task should be header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_head_304() {
+        init_log();
+        // HEAD + 304 Not Modified
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 304);
+                assert!(eob, "HEAD 304 should be end of body");
+            }
+            _ => panic!("task should be header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_head_101_non_upgrade() {
+        init_log();
+        // HEAD + 101 where the request is not an upgrade request.
+        // Contrived, but verifies the new code path: 101 check fires first,
+        // is_upgrade_req() returns false, then HEAD check fires.
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 101);
+                // HEAD without Upgrade headers → not an upgrade, body is "done"
+                assert!(eob, "HEAD 101 (non-upgrade) should be end of body");
+            }
+            _ => panic!("task should be header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
 }
 
 #[cfg(test)]
@@ -2248,5 +2521,26 @@ mod test_sync {
         assert_eq!("/", req.path.unwrap());
         assert_eq!(b"Foo", headers[0].name.as_bytes());
         assert_eq!(b"Bar", headers[0].value);
+    }
+
+    /// Deterministic, parser-independent test of the request-line delimiter
+    /// guard. Testing it through `http_req_header_to_wire`/`RequestHeader` is
+    /// unreliable because whether `set_raw_path` admits a delimiter byte depends
+    /// on the linked `http` crate's URI validation; the predicate itself has no
+    /// such dependency.
+    #[test]
+    fn test_request_target_has_forbidden_byte() {
+        const FORBIDDEN: [u8; 4] = [0x00, 0x0a, 0x0d, 0x20];
+        for b in 0x00u8..=0xff {
+            let expected = FORBIDDEN.contains(&b);
+            assert_eq!(
+                request_target_has_forbidden_byte(&[b]),
+                expected,
+                "byte {b:#04x}: expected forbidden={expected}",
+            );
+        }
+        assert!(!request_target_has_forbidden_byte(b"/normal/path?a=b"));
+        assert!(request_target_has_forbidden_byte(b"/x HTTP/1.1")); // SP
+        assert!(request_target_has_forbidden_byte(b"/a\r\nb")); // CR/LF
     }
 }

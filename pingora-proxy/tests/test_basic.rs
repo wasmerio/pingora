@@ -28,7 +28,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
-use utils::server_utils::init;
+use utils::server_utils::{
+    init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
+};
 
 fn is_specified_port(port: u16) -> bool {
     (1..65535).contains(&port)
@@ -387,15 +389,18 @@ async fn test_dropped_conn_get() {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    reset_suppress_proxy_warn_log_calls();
     let res = client
         .get("http://127.0.0.1:6147/bad_lb")
         .header("x-port", port)
+        .header("x-test-suppress-proxy-warn-log", "true")
         .send()
         .await
         .unwrap();
 
     // retry gives 200
     assert_eq!(res.status(), StatusCode::OK);
+    assert!(suppress_proxy_warn_log_calls() > 0);
     let body = res.text().await.unwrap();
     assert_eq!(body, "dog!\n");
 }
@@ -1103,15 +1108,19 @@ async fn test_error_after_headers_sent_rst_received() {
     let response = response.await.unwrap();
     let mut body = response.into_body();
 
-    match body.data().await.unwrap() {
+    match body.data().await.expect("response body frame or reset") {
         Ok(chunk) => {
             assert_eq!(chunk, Bytes::from_static(b"AAAAA"));
 
-            let err = body.data().await.unwrap().err().unwrap();
-            assert_eq!(err.reason().unwrap(), h2::Reason::CANCEL);
+            let err = body
+                .data()
+                .await
+                .expect("response body reset")
+                .expect_err("expected stream reset");
+            assert_eq!(err.reason().expect("reset reason"), h2::Reason::CANCEL);
         }
         Err(err) => {
-            assert_eq!(err.reason().unwrap(), h2::Reason::CANCEL);
+            assert_eq!(err.reason().expect("reset reason"), h2::Reason::CANCEL);
         }
     }
 }
