@@ -84,6 +84,7 @@ impl<C: CachePut> CachePutCtx<C> {
     }
 
     async fn put_header(&mut self, meta: CacheMeta) -> Result<()> {
+        #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
         let mut trace = self.trace.child("cache put header", |o| o.start());
         let miss_handler = self
             .storage
@@ -239,7 +240,7 @@ impl<C: CachePut> CachePutCtx<C> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use cf_rustracing::span::Span;
+    use crate::trace::Span;
     use once_cell::sync::Lazy;
 
     struct TestCachePut();
@@ -520,7 +521,8 @@ mod parse_response {
             for header in resp.headers {
                 // TODO: consider hold a Bytes and all header values can be Bytes referencing the
                 // original buffer without reallocation
-                response.append_header(header.name.to_owned(), header.value.to_owned())?;
+                let header_value = pingora_http::header_value_from_slice(header.value);
+                response.append_header(header.name.to_owned(), header_value)?;
             }
             // TODO: see above, we can make header value `Bytes` referencing header_bytes
             let header_bytes = self.buf.split_to(split_to).freeze();

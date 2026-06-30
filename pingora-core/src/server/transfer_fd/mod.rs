@@ -17,7 +17,7 @@ use log::{debug, error, warn};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{
-    self, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag,
+    self, AddressFamily, Backlog, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag,
     SockType, UnixAddr,
 };
 #[cfg(target_os = "linux")]
@@ -29,6 +29,8 @@ use std::collections::HashMap;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::{thread, time};
@@ -45,9 +47,7 @@ const MAGIC_PREFIX: [u8; 8] = [0, b'P', b'I', b'N', b'G', b'F', b'D', b'2'];
 #[cfg(target_os = "linux")]
 const V2_HEADER_LEN: usize = MAGIC_PREFIX.len() + 8; // magic + fd_count + payload_len
 #[cfg(target_os = "linux")]
-const V2_MAX_FD_CHUNK: usize = 32;
-#[cfg(target_os = "linux")]
-const MAX_FDS_V1: usize = 32;
+const MAX_FDS: usize = 32;
 
 impl Fds {
     pub fn new() -> Self {
@@ -62,6 +62,10 @@ impl Fds {
 
     pub fn get(&self, bind: &str) -> Option<&RawFd> {
         self.map.get(bind)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     pub fn serialize(&self) -> (Vec<String>, Vec<RawFd>) {
@@ -140,20 +144,27 @@ where
             // TODO: warn if exist but not able to unlink
         }
     };
-    socket::bind(listen_fd, &unix_addr).unwrap();
+    socket::bind(listen_fd.as_raw_fd(), &unix_addr).unwrap();
 
     /* sock is created before we change user, need to give permission */
     stat::fchmodat(
-        None,
+        // SAFETY: AT_FDCWD is a well-defined POSIX sentinel constant used by *at() syscalls
+        // to indicate the current working directory. It is not a real file descriptor and does
+        // not require ownership or lifetime guarantees.
+        unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
         path,
         stat::Mode::from_bits_truncate(0o666),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();
 
-    socket::listen(listen_fd, 8).unwrap();
+    socket::listen(
+        &listen_fd,
+        Backlog::new(8).expect("8 is well within SOMAXCONN"),
+    )
+    .unwrap();
 
-    let fd = match accept_with_retry_timeout(listen_fd, max_retry) {
+    let fd = match accept_with_retry_timeout(listen_fd.as_raw_fd(), max_retry) {
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
@@ -262,12 +273,12 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
 #[cfg(target_os = "linux")]
 fn receive_v1(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error> {
     let mut io_vec = [IoSliceMut::new(payload); 1];
-    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS_V1]);
+    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
     let msg: RecvMsg<UnixAddr> =
         socket::recvmsg(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()).unwrap();
 
     let mut fds: Vec<RawFd> = Vec::new();
-    for cmsg in msg.cmsgs() {
+    for cmsg in msg.cmsgs()? {
         if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
             fds.append(&mut vec_fds)
         } else {
@@ -282,7 +293,7 @@ fn receive_v1(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Erro
 fn read_exact_retry(fd: RawFd, mut buf: &mut [u8]) -> Result<(), Error> {
     let mut nonblocking_polls = 0;
     while !buf.is_empty() {
-        match read(fd, buf) {
+        match read(unsafe { BorrowedFd::borrow_raw(fd) }, buf) {
             Ok(0) => return Err(EIO),
             Ok(n) => {
                 let tmp = buf;
@@ -331,7 +342,7 @@ fn receive_v2(
     while fds.len() < fd_count {
         let mut data = [0u8; 1];
         let mut io_vec = [IoSliceMut::new(&mut data)];
-        let mut cmsg_buf = nix::cmsg_space!([RawFd; V2_MAX_FD_CHUNK]);
+        let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
 
         match socket::recvmsg::<UnixAddr>(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()) {
             Ok(msg) => {
@@ -343,7 +354,7 @@ fn receive_v2(
                 {
                     return Err(EIO);
                 }
-                for cmsg in msg.cmsgs() {
+                for cmsg in msg.cmsgs()? {
                     if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
                         fds.append(&mut vec_fds)
                     }
@@ -374,7 +385,7 @@ fn receive_v2(
 fn write_all_retry(fd: RawFd, mut buf: &[u8], max_nonblocking_polls: usize) -> Result<(), Error> {
     let mut polls = 0;
     while !buf.is_empty() {
-        match write(fd, buf) {
+        match write(unsafe { BorrowedFd::borrow_raw(fd) }, buf) {
             Ok(0) => return Err(EIO),
             Ok(n) => buf = &buf[n..],
             Err(Errno::EAGAIN) => {
@@ -388,6 +399,99 @@ fn write_all_retry(fd: RawFd, mut buf: &[u8], max_nonblocking_polls: usize) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn send_fds_v1(
+    fd: RawFd,
+    fds: &[RawFd],
+    payload: &[u8],
+    path: &dyn std::fmt::Display,
+    nonblocking_polls: &mut usize,
+) -> Result<usize, Error> {
+    let io_vec = [IoSlice::new(payload); 1];
+    let scm = socket::ControlMessage::ScmRights(fds);
+    let cmsg = [scm; 1];
+    loop {
+        match socket::sendmsg(fd, &io_vec, &cmsg, MsgFlags::empty(), None::<&UnixAddr>) {
+            Ok(result) => break Ok(result),
+            Err(e) => match e {
+                /* handle nonblocking IO */
+                Errno::EAGAIN => {
+                    *nonblocking_polls += 1;
+                    if *nonblocking_polls >= MAX_NONBLOCKING_POLLS {
+                        error!(
+                            "Sendmsg() not ready after retries when sending socket to: {}",
+                            path
+                        );
+                        break Err(e);
+                    }
+                    warn!(
+                        "Sendmsg() not ready, will try again in {:?}",
+                        NONBLOCKING_POLL_INTERVAL
+                    );
+                    thread::sleep(NONBLOCKING_POLL_INTERVAL);
+                }
+                _ => break Err(e),
+            },
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_fds_v2(
+    fd: RawFd,
+    fds: &[RawFd],
+    payload: &[u8],
+    path: &dyn std::fmt::Display,
+    nonblocking_polls: &mut usize,
+) -> Result<usize, Error> {
+    let mut header = vec![0u8; V2_HEADER_LEN];
+    header[..MAGIC_PREFIX.len()].copy_from_slice(&MAGIC_PREFIX);
+    header[MAGIC_PREFIX.len()..MAGIC_PREFIX.len() + 4]
+        .copy_from_slice(&(fds.len() as u32).to_be_bytes());
+    header[MAGIC_PREFIX.len() + 4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+
+    write_all_retry(fd, &header, MAX_NONBLOCKING_POLLS)?;
+    write_all_retry(fd, payload, MAX_NONBLOCKING_POLLS)?;
+
+    let mut sent_fds = 0;
+    while sent_fds < fds.len() {
+        let end = usize::min(sent_fds + MAX_FDS, fds.len());
+        let data = [0xFFu8; 1];
+        let io_vec = [IoSlice::new(&data)];
+        let scm = ControlMessage::ScmRights(&fds[sent_fds..end]);
+        let cmsg = [scm; 1];
+
+        loop {
+            match socket::sendmsg(fd, &io_vec, &cmsg, MsgFlags::empty(), None::<&UnixAddr>) {
+                Ok(_) => break,
+                Err(e) => match e {
+                    /* handle nonblocking IO */
+                    Errno::EAGAIN => {
+                        *nonblocking_polls += 1;
+                        if *nonblocking_polls >= MAX_NONBLOCKING_POLLS {
+                            error!(
+                                "Sendmsg() not ready after retries when sending socket to: {}",
+                                path
+                            );
+                            return Err(e);
+                        }
+                        warn!(
+                            "Sendmsg() not ready, will try again in {:?}",
+                            NONBLOCKING_POLL_INTERVAL
+                        );
+                        thread::sleep(NONBLOCKING_POLL_INTERVAL);
+                    }
+                    _ => return Err(e),
+                },
+            }
+        }
+
+        sent_fds = end;
+    }
+
+    Ok(header.len() + payload.len())
 }
 
 #[cfg(target_os = "linux")]
@@ -413,7 +517,7 @@ where
     let mut nonblocking_polls = 0;
 
     let conn_result: Result<usize, Error> = loop {
-        match socket::connect(send_fd, &unix_addr) {
+        match socket::connect(send_fd.as_raw_fd(), &unix_addr) {
             Ok(_) => break Ok(0),
             Err(e) => match e {
                 /* If the new process hasn't created the upgrade sock we'll get an ENOENT.
@@ -452,77 +556,20 @@ where
     };
 
     let result = match conn_result {
-        Ok(_) => {
-            // V2 framing: magic + fd_count + payload_len, then payload bytes, then FD chunks.
-            let header_len = MAGIC_PREFIX.len() + 8;
-            let mut header = vec![0u8; header_len];
-            header[..MAGIC_PREFIX.len()].copy_from_slice(&MAGIC_PREFIX);
-            header[MAGIC_PREFIX.len()..MAGIC_PREFIX.len() + 4]
-                .copy_from_slice(&(fds.len() as u32).to_be_bytes());
-            header[MAGIC_PREFIX.len() + 4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-
-            let mut result: Result<usize, Error> = Ok(0);
-            'send: {
-                if let Err(e) = write_all_retry(send_fd, &header, MAX_NONBLOCKING_POLLS) {
-                    result = Err(e);
-                    break 'send;
-                }
-                if let Err(e) = write_all_retry(send_fd, payload, MAX_NONBLOCKING_POLLS) {
-                    result = Err(e);
-                    break 'send;
-                }
-
-                // Send FDs in bounded chunks to avoid ancillary truncation.
-                let mut sent_fds = 0;
-                while sent_fds < fds.len() {
-                    let end = usize::min(sent_fds + V2_MAX_FD_CHUNK, fds.len());
-                    let scm = ControlMessage::ScmRights(&fds[sent_fds..end]);
-                    let cmsg = [scm; 1];
-                    let data = [0xFFu8; 1];
-                    let io_vec = [IoSlice::new(&data)];
-
-                    loop {
-                        match socket::sendmsg(
-                            send_fd,
-                            &io_vec,
-                            &cmsg,
-                            socket::MsgFlags::empty(),
-                            None::<&UnixAddr>,
-                        ) {
-                            Ok(_) => break,
-                            Err(e) => match e {
-                                /* handle nonblocking IO */
-                                Errno::EAGAIN => {
-                                    nonblocking_polls += 1;
-                                    if nonblocking_polls >= MAX_NONBLOCKING_POLLS {
-                                        error!("Sendmsg() not ready after retries when sending socket to: {}", path);
-                                        result = Err(e);
-                                        break 'send;
-                                    }
-                                    warn!(
-                                        "Sendmsg() not ready, will try again in {:?}",
-                                        NONBLOCKING_POLL_INTERVAL
-                                    );
-                                    thread::sleep(NONBLOCKING_POLL_INTERVAL);
-                                }
-                                _ => {
-                                    result = Err(e);
-                                    break 'send;
-                                }
-                            },
-                        }
-                    }
-
-                    sent_fds = end;
-                }
-
-                if result.is_ok() {
-                    result = Ok(header.len() + payload.len());
-                }
-            }
-
-            result
-        }
+        Ok(_) if fds.len() <= MAX_FDS => send_fds_v1(
+            send_fd.as_raw_fd(),
+            fds.as_slice(),
+            payload,
+            &path,
+            &mut nonblocking_polls,
+        ),
+        Ok(_) => send_fds_v2(
+            send_fd.as_raw_fd(),
+            fds.as_slice(),
+            payload,
+            &path,
+            &mut nonblocking_polls,
+        ),
         Err(_) => conn_result,
     };
 
@@ -546,6 +593,8 @@ where
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
     use log::{debug, error};
 
@@ -614,7 +663,7 @@ mod tests {
             assert_eq!(1, buf[31]);
         });
 
-        let fds = vec![dumb_fd];
+        let fds = vec![dumb_fd.as_raw_fd()];
         let buf: [u8; 32] = [1; 32];
         match send_fds_to(fds, &buf, "/tmp/pingora_fds_receive.sock", None) {
             Ok(sent) => {
@@ -641,7 +690,7 @@ mod tests {
             None,
         )
         .unwrap();
-        fds.add(key1.clone(), dumb_fd1);
+        fds.add(key1.clone(), dumb_fd1.as_raw_fd());
         let key2 = "1.1.1.1:443".to_string();
         let dumb_fd2 = socket::socket(
             AddressFamily::Unix,
@@ -650,7 +699,7 @@ mod tests {
             None,
         )
         .unwrap();
-        fds.add(key2.clone(), dumb_fd2);
+        fds.add(key2.clone(), dumb_fd2.as_raw_fd());
 
         let child = thread::spawn(move || {
             let mut fds2 = Fds::new();
@@ -687,7 +736,7 @@ mod tests {
         });
 
         let payload = [7u8; 16];
-        let fds = vec![dumb_fd];
+        let fds = vec![dumb_fd.as_raw_fd()];
         legacy_send_fds("/tmp/pingora_fds_receive_v1.sock", &fds, &payload).unwrap();
         child.join().unwrap();
     }
@@ -695,6 +744,7 @@ mod tests {
     #[test]
     fn test_v2_chunked_send_more_than_32() {
         init_log();
+        let mut owned_fds = Vec::new();
         let mut fds: Vec<RawFd> = Vec::new();
         for _ in 0..40 {
             let fd = socket::socket(
@@ -704,7 +754,8 @@ mod tests {
                 None,
             )
             .unwrap();
-            fds.push(fd);
+            fds.push(fd.as_raw_fd());
+            owned_fds.push(fd);
         }
 
         let payload = [9u8; 24];
@@ -735,7 +786,7 @@ mod tests {
         )
         .unwrap();
 
-        let fds = vec![dumb_fd];
+        let fds = vec![dumb_fd.as_raw_fd()];
         let buf: [u8; 32] = [1; 32];
 
         let start = Instant::now();
@@ -792,7 +843,7 @@ mod tests {
         let unix_addr = UnixAddr::new(path)?;
         let mut retry = 0;
         loop {
-            match socket::connect(send_fd, &unix_addr) {
+            match socket::connect(send_fd.as_raw_fd(), &unix_addr) {
                 Ok(_) => break,
                 Err(e) => match e {
                     Errno::ENOENT | Errno::ECONNREFUSED | Errno::EACCES => {
@@ -811,7 +862,7 @@ mod tests {
         let scm = socket::ControlMessage::ScmRights(fds);
         let cmsg = [scm; 1];
         socket::sendmsg(
-            send_fd,
+            send_fd.as_raw_fd(),
             &io_vec,
             &cmsg,
             socket::MsgFlags::empty(),

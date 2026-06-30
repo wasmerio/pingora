@@ -38,8 +38,8 @@ log = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = "0.12"
 # Pin below 1.3.0 because newer releases depend on rand 0.10, which requires edition 2024.
-cf-rustracing = "=1.2.1"
-cf-rustracing-jaeger = "=1.2.2"
+cf-rustracing = { version = "=1.2.1", optional = true }
+cf-rustracing-jaeger = { version = "=1.2.2", optional = true }
 rmp = "0.8.14"
 tokio = { workspace = true }
 lru = { workspace = true }
@@ -48,13 +48,16 @@ hex = "0.4"
 httparse = { workspace = true }
 strum = { version = "0.26", features = ["derive"] }
 rand = "0.8"
+arrayvec = "0"
 
 [dev-dependencies]
+cf-rustracing = "1.0"
+cf-rustracing-jaeger = "1.0"
 tokio-test = "0.4"
 tokio = { workspace = true, features = ["fs"] }
 env_logger = "0.11"
 dhat = "0"
-futures = "0.3"
+futures = { workspace = true }
 
 [[bench]]
 name = "simple_lru_memory"
@@ -74,3 +77,4 @@ openssl = ["pingora-core/openssl"]
 boringssl = ["pingora-core/boringssl"]
 rustls = ["pingora-core/rustls"]
 s2n = ["pingora-core/s2n"]
+trace = ["dep:cf-rustracing", "dep:cf-rustracing-jaeger"]

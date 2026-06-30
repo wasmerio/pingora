@@ -34,6 +34,7 @@ use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream};
+use crate::server::ShutdownWatch;
 use crate::{Error, ErrorType, OrErr, Result};
 
 const BODY_BUF_LIMIT: usize = 1024 * 64;
@@ -76,6 +77,77 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
             "while h2 handshaking with client",
             e,
         ),
+    }
+}
+
+/// Drive a server-side HTTP/2 connection's accept loop, dispatching each new
+/// stream to `on_session` until the connection closes.
+///
+/// This loop ends in one of three ways:
+///   * the client closes the H2 connection cleanly ([`HttpSession::from_h2_conn`]
+///     returns `Ok(None)` after the final GOAWAY is flushed),
+///   * the codec hits a connection error, or
+///   * the runtime-level `graceful_shutdown_timeout_seconds` ceiling fires and
+///     force-kills the task driving this future.
+///
+/// On a shutdown signal:
+///   1. [`h2::server::Connection::graceful_shutdown`] is called, which
+///      enqueues a GOAWAY with the maximum possible last_stream_id per
+///      RFC 9113 §6.8. The codec emits a second, real GOAWAY when the
+///      connection finishes draining.
+///   2. The loop continues calling [`HttpSession::from_h2_conn`] so that:
+///      - streams whose HEADERS were buffered in the codec before the shutdown
+///        signal arrived are still surfaced and dispatched,
+///      - streams the client opens after observing GOAWAY(MAX) but below the
+///        eventual last_stream_id are also dispatched, and
+///      - the codec is driven to completion so the final GOAWAY can be
+///        flushed and the connection closed cleanly.
+///
+/// `on_session` is invoked once per accepted stream. Typical callers spawn a
+/// task to process the session so the accept loop is not blocked.
+///
+/// Note: this function does not impose its own per-connection drain timeout.
+/// The runtime-level `graceful_shutdown_timeout_seconds` is the only ceiling,
+/// so a slow client can keep this future alive up to that bound.
+// TODO: add a per-connection drain timeout to bound how long a single
+// misbehaving client can keep this task alive after GOAWAY.
+pub(crate) async fn accept_downstream_sessions<F>(
+    mut conn: H2Connection<Stream>,
+    digest: Arc<Digest>,
+    mut shutdown: ShutdownWatch,
+    mut on_session: F,
+) where
+    F: FnMut(HttpSession),
+{
+    let mut shutdown_initiated = false;
+    loop {
+        let h2_stream = if shutdown_initiated {
+            HttpSession::from_h2_conn(&mut conn, digest.clone()).await
+        } else {
+            tokio::select! {
+                // Poll the shutdown signal first so a concurrent signal is
+                // observed deterministically. `from_h2_conn` is cancel-safe
+                // and is polled again on the next iteration.
+                biased;
+                _ = shutdown.changed() => {
+                    conn.graceful_shutdown();
+                    shutdown_initiated = true;
+                    continue;
+                }
+                h2_stream = HttpSession::from_h2_conn(&mut conn, digest.clone()) => h2_stream,
+            }
+        };
+        match h2_stream {
+            Err(e) => {
+                // It is common for the client to just disconnect TCP without
+                // properly closing H2. So we don't log the errors here
+                debug!("H2 error when accepting new stream {e}");
+                return;
+            }
+            // None means the connection is ready to be closed
+            Ok(None) => return,
+            Ok(Some(session)) => on_session(session),
+        }
     }
 }
 
@@ -493,10 +565,23 @@ impl HttpSession {
 
     /// Give up the stream abruptly.
     ///
-    /// This will send a `INTERNAL_ERROR` stream error to the client
+    /// This will send an `INTERNAL_ERROR` stream error to the client.
     pub fn shutdown(&mut self) {
+        self.shutdown_with_reason(h2::Reason::INTERNAL_ERROR);
+    }
+
+    /// Give up the stream abruptly with a custom reason.
+    ///
+    /// This will send a `RST_STREAM` frame with the given reason to the client.
+    ///
+    /// Useful reasons include:
+    /// - [`h2::Reason::HTTP_1_1_REQUIRED`] - Signal to the client that HTTP/1.1 should be used
+    ///   instead. Per RFC 7540 §9.1.2, clients should retry the request over HTTP/1.1.
+    /// - [`h2::Reason::CANCEL`] - Indicate the stream is no longer needed.
+    /// - [`h2::Reason::REFUSED_STREAM`] - Indicate the stream was refused before processing.
+    pub fn shutdown_with_reason(&mut self, reason: h2::Reason) {
         if !self.ended {
-            self.send_response.send_reset(h2::Reason::INTERNAL_ERROR);
+            self.send_response.send_reset(reason);
         }
     }
 
@@ -909,6 +994,17 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+
+            // Drain the response to EOS before dropping the stream. Newer h2
+            // sends RST_STREAM(CANCEL) when a still-open recv stream is dropped,
+            // which would race with the server reading the request EOS and turn
+            // the server-side read into a stream-reset error.
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.expect("response body error");
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .expect("release capacity");
+            }
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
@@ -939,8 +1035,12 @@ mod test {
                 http.write_body(server_body.into(), true).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
-                // 3. Waiting for the client to close stream.
+                // 3. Read the empty DATA frame carrying the request EOS.
                 http.read_body_or_idle(http.is_body_done()).await.unwrap();
+
+                // 4. Finish the response so the client can drain it to EOS and
+                //    close the stream cleanly instead of cancelling it.
+                http.finish().unwrap();
             }));
         }
 
