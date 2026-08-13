@@ -529,6 +529,18 @@ impl Session {
         }
     }
 
+    /// Whether an HTTP/2 response `END_STREAM` has been accepted by the send stream.
+    ///
+    /// Returns `Some` only for HTTP/2 sessions. `Some(true)` means that a headers-only response,
+    /// final DATA frame, trailers, or an explicit finish successfully carried `END_STREAM`.
+    /// This is deliberately not generalized to protocols with different completion semantics.
+    pub fn response_end_stream_sent(&self) -> Option<bool> {
+        match self {
+            Self::H2(s) => Some(s.response_end_stream_sent()),
+            Self::H1(_) | Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
     /// Give up the http session abruptly.
     /// For H1 this will close the underlying connection
     /// For H2 this will send RESET frame to end this stream without impacting the connection

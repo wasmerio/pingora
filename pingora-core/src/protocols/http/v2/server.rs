@@ -25,6 +25,7 @@ use http::{header, HeaderMap, Response};
 use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
+use std::fmt;
 use std::sync::Arc;
 use std::task::ready;
 use std::time::Duration;
@@ -46,6 +47,36 @@ pub use h2::server::Builder as H2Options;
 // 64 KiB decoded header-list limit.
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// A structured cause indicating that the downstream client reset an HTTP/2 stream.
+///
+/// Errors returned by [`HttpSession::read_body_or_idle`] use this as their root cause when
+/// `h2` reports a reset reason. [`Self::find`] retrieves it through Pingora error-context
+/// wrapping without relying on formatted error messages.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DownstreamH2Reset {
+    reason: h2::Reason,
+}
+
+impl DownstreamH2Reset {
+    /// Find a downstream reset in a Pingora error cause chain.
+    pub fn find(error: &Error) -> Option<&Self> {
+        error.root_cause().downcast_ref()
+    }
+
+    /// Return the HTTP/2 reset reason sent by the downstream client.
+    pub fn reason(&self) -> h2::Reason {
+        self.reason
+    }
+}
+
+impl fmt::Display for DownstreamH2Reset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "downstream HTTP/2 stream reset: {}", self.reason)
+    }
+}
+
+impl std::error::Error for DownstreamH2Reset {}
 
 /// Build [`H2Options`] with bounded defaults for received requests.
 ///
@@ -563,6 +594,15 @@ impl HttpSession {
         self.response_written.as_deref()
     }
 
+    /// Whether an `END_STREAM` flag has been accepted by the HTTP/2 send stream.
+    ///
+    /// This becomes `true` only after a successful headers-only response, final DATA frame,
+    /// trailers, or [`Self::finish`]. It remains `false` when those operations fail, and does not
+    /// imply that the peer received the frame.
+    pub fn response_end_stream_sent(&self) -> bool {
+        self.ended
+    }
+
     /// Give up the stream abruptly.
     ///
     /// This will send an `INTERNAL_ERROR` stream error to the client.
@@ -650,9 +690,10 @@ impl HttpSession {
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {
             let reason = self.idle().await?;
-            Error::e_explain(
+            Error::e_because(
                 ErrorType::H2Error,
                 format!("Client closed H2, reason: {reason}"),
+                DownstreamH2Reset { reason },
             )
         } else {
             self.read_body_bytes().await
@@ -697,7 +738,74 @@ mod test {
     use h2::frame::{Frame, Settings};
     use http::{HeaderValue, Method, Request};
     use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
+    use tokio::sync::oneshot;
     use tokio_stream::StreamExt;
+
+    struct H2TestPeer {
+        request_body: Option<SendStream<Bytes>>,
+        _response: h2::client::ResponseFuture,
+        _client: h2::client::SendRequest<Bytes>,
+        client_driver: tokio::task::JoinHandle<()>,
+        server_driver: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for H2TestPeer {
+        fn drop(&mut self) {
+            self.client_driver.abort();
+            self.server_driver.abort();
+        }
+    }
+
+    async fn test_session() -> (HttpSession, H2TestPeer) {
+        let (client_io, server_io) = duplex(65536);
+        let client_handshake = tokio::spawn(h2::client::handshake(client_io));
+        let mut server_connection = handshake(Box::new(server_io), None).await.unwrap();
+        let (client, client_connection) = client_handshake.await.unwrap().unwrap();
+
+        let client_driver = tokio::spawn(async move {
+            let _ = client_connection.await;
+        });
+
+        let (session_tx, session_rx) = oneshot::channel();
+        let server_driver = tokio::spawn(async move {
+            let digest = Arc::new(Digest::default());
+            let session = HttpSession::from_h2_conn(&mut server_connection, digest.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            if session_tx.send(session).is_err() {
+                return;
+            }
+
+            while HttpSession::from_h2_conn(&mut server_connection, digest.clone())
+                .await
+                .is_ok_and(|session| session.is_some())
+            {}
+        });
+
+        let mut client = client.ready().await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://www.example.com/")
+            .body(())
+            .unwrap();
+        let (response, request_body) = client.send_request(request, false).unwrap();
+        let session = tokio::time::timeout(Duration::from_secs(1), session_rx)
+            .await
+            .expect("server did not accept the test stream")
+            .unwrap();
+
+        (
+            session,
+            H2TestPeer {
+                request_body: Some(request_body),
+                _response: response,
+                _client: client,
+                client_driver,
+                server_driver,
+            },
+        )
+    }
 
     async fn advertised_settings(options: Option<H2Options>) -> Settings {
         let (mut client, server) = duplex(65536);
@@ -741,6 +849,82 @@ mod test {
 
         assert_eq!(settings.max_header_list_size(), Some(1234));
         assert_eq!(settings.max_concurrent_streams(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn downstream_reset_reasons_survive_error_context() {
+        for reason in [
+            h2::Reason::CANCEL,
+            h2::Reason::NO_ERROR,
+            h2::Reason::REFUSED_STREAM,
+        ] {
+            let (mut session, mut peer) = test_session().await;
+            peer.request_body.take().unwrap().send_reset(reason);
+
+            let error =
+                tokio::time::timeout(Duration::from_secs(1), session.read_body_or_idle(true))
+                    .await
+                    .expect("server did not observe the stream reset")
+                    .unwrap_err()
+                    .more_context("outer application context");
+
+            assert_eq!(error.etype(), &ErrorType::H2Error);
+            assert_eq!(
+                DownstreamH2Reset::find(&error).map(|reset| reset.reason()),
+                Some(reason)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_end_stream_tracks_only_successful_h2_completion() {
+        let response = || Box::new(ResponseHeader::build(200, None).unwrap());
+
+        let (mut headers_only, _peer) = test_session().await;
+        assert!(!headers_only.response_end_stream_sent());
+        headers_only
+            .write_response_header(response(), true)
+            .unwrap();
+        assert!(headers_only.response_end_stream_sent());
+        let headers_only = crate::protocols::http::ServerSession::new_http2(headers_only);
+        assert_eq!(headers_only.response_end_stream_sent(), Some(true));
+
+        let (mut final_data, _peer) = test_session().await;
+        final_data.write_response_header(response(), false).unwrap();
+        assert!(!final_data.response_end_stream_sent());
+        final_data
+            .write_body(Bytes::from_static(b"complete"), true)
+            .await
+            .unwrap();
+        assert!(final_data.response_end_stream_sent());
+
+        let (mut trailers, _peer) = test_session().await;
+        trailers.write_response_header(response(), false).unwrap();
+        assert!(!trailers.response_end_stream_sent());
+        trailers.write_trailers(HeaderMap::new()).unwrap();
+        assert!(trailers.response_end_stream_sent());
+
+        let (mut finished, _peer) = test_session().await;
+        finished.write_response_header(response(), false).unwrap();
+        assert!(!finished.response_end_stream_sent());
+        finished.finish().unwrap();
+        assert!(finished.response_end_stream_sent());
+
+        let (mut reset, mut peer) = test_session().await;
+        peer.request_body
+            .take()
+            .unwrap()
+            .send_reset(h2::Reason::CANCEL);
+        tokio::time::timeout(Duration::from_secs(1), reset.read_body_or_idle(true))
+            .await
+            .expect("server did not observe the stream reset")
+            .unwrap_err();
+        assert!(reset.write_response_header(response(), true).is_err());
+        assert!(!reset.response_end_stream_sent());
+
+        let (h1_io, _) = duplex(64);
+        let h1 = crate::protocols::http::ServerSession::new_http1(Box::new(h1_io));
+        assert_eq!(h1.response_end_stream_sent(), None);
     }
 
     #[tokio::test]
