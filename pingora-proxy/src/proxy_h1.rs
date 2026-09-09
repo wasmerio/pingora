@@ -1002,6 +1002,7 @@ pub(crate) async fn send_body_to1(
     recv_task: Option<HttpTask>,
 ) -> Result<bool> {
     let body_done;
+    let http_body = matches!(recv_task, Some(HttpTask::Body(..)));
 
     if let Some(task) = recv_task {
         match task {
@@ -1073,11 +1074,70 @@ pub(crate) async fn send_body_to1(
         match client_session.finish_body().await {
             Ok(_) => {
                 debug!("finish sending body to upstream");
-                Ok(true)
+                // The 101 response can arrive before a queued HTTP body-end
+                // task. Finish that HTTP body without ending the upgraded
+                // stream; only UpgradedBody (or channel closure) can do that.
+                Ok(!http_body || !client_session.was_upgraded())
             }
             Err(e) => e.into_up().into_err(),
         }
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use tokio_test::io::Builder;
+
+    #[tokio::test]
+    async fn http_body_completion_does_not_close_an_upgraded_stream() {
+        for response_first in [false, true] {
+            let io = Builder::new()
+                .write(b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n")
+                .read(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+                .write(b"hello")
+                .read(b"echo")
+                .build();
+            let mut session = HttpSessionV1::new(Box::new(io));
+            let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+            request.insert_header("Connection", "Upgrade").unwrap();
+            request.insert_header("Upgrade", "websocket").unwrap();
+            request.insert_header("Content-Length", "0").unwrap();
+            session
+                .write_request_header(Box::new(request))
+                .await
+                .unwrap();
+            if response_first {
+                session.read_response_task().await.unwrap();
+            }
+            let done = send_body_to1(&mut session, Some(HttpTask::Body(None, true)))
+                .await
+                .unwrap();
+            assert_eq!(done, !response_first, "response_first={response_first}");
+            if !response_first {
+                session.read_response_task().await.unwrap();
+            }
+            assert!(session.was_upgraded());
+            assert!(!send_body_to1(
+                &mut session,
+                Some(HttpTask::UpgradedBody(
+                    Some(bytes::Bytes::from_static(b"hello")),
+                    false,
+                ))
+            )
+            .await
+            .unwrap());
+            let response = session.read_response_task().await.unwrap();
+            assert!(
+                matches!(response, HttpTask::UpgradedBody(Some(body), false) if body == b"echo"[..])
+            );
+            assert!(
+                send_body_to1(&mut session, Some(HttpTask::UpgradedBody(None, true)))
+                    .await
+                    .unwrap()
+            );
+        }
     }
 }
