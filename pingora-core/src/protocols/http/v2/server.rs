@@ -68,6 +68,11 @@ pub struct DownstreamH2Reset {
 }
 
 impl DownstreamH2Reset {
+    /// Record a reset reason reported by a downstream HTTP/2 stream watcher.
+    pub fn new(reason: h2::Reason) -> Self {
+        Self { reason }
+    }
+
     /// Find a downstream reset in a Pingora error cause chain.
     pub fn find(error: &Error) -> Option<&Self> {
         error.root_cause().downcast_ref()

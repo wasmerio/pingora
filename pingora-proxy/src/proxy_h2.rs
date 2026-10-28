@@ -26,6 +26,15 @@ use pingora_core::protocols::http::authority::{
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
+fn downstream_h2_close_error(reason: h2::Reason) -> Box<Error> {
+    Error::because(
+        H2Error,
+        format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
+        pingora_core::protocols::http::DownstreamH2Reset::new(reason),
+    )
+    .into_down()
+}
+
 /// Derive H2 `:path`, separating H1 absolute-form components ([RFC 9113 section 8.3.1]).
 ///
 /// Reclassifies after filters and rejects non-UTF-8 or ambiguous targets.
@@ -1182,10 +1191,7 @@ where
                 }
                 close_result = stream_close => {
                     return match close_result {
-                        Ok(reason) => Error::e_explain(
-                            H2Error,
-                            format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
-                        ),
+                        Ok(reason) => Err(downstream_h2_close_error(reason)),
                         Err(e) => Err(e),
                     }
                     .map_err(|e| H2BodySendError { error: e.into_down(), downstream_closed: true });
@@ -1494,6 +1500,23 @@ mod tests {
     use pingora_cache::{CacheKey, NoCacheReason};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn blocked_upload_close_keeps_structured_downstream_reset() {
+        for reason in [
+            h2::Reason::CANCEL,
+            h2::Reason::NO_ERROR,
+            h2::Reason::INTERNAL_ERROR,
+        ] {
+            let error = downstream_h2_close_error(reason).more_context("upstream body write");
+            assert_eq!(error.esource(), &ErrorSource::Downstream);
+            assert_eq!(
+                pingora_core::protocols::http::DownstreamH2Reset::find(&error)
+                    .map(|reset| reset.reason()),
+                Some(reason),
+            );
+        }
+    }
 
     const REJECTED: NoCacheReason = NoCacheReason::Custom("rejected request body");
 
