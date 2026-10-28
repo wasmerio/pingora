@@ -17,8 +17,7 @@ use log::{debug, error, warn};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{
-    self, AddressFamily, Backlog, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag,
-    SockType, UnixAddr,
+    self, AddressFamily, Backlog, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr,
 };
 #[cfg(target_os = "linux")]
 use nix::sys::stat;
@@ -26,11 +25,11 @@ use nix::sys::stat;
 use nix::unistd::{read, write};
 use nix::{errno::Errno::EIO, Error, NixPath};
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "linux")]
+use std::io::IoSlice;
 use std::io::Write;
 #[cfg(target_os = "linux")]
-use std::io::{IoSlice, IoSliceMut};
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::{thread, time};
@@ -48,6 +47,9 @@ const MAGIC_PREFIX: [u8; 8] = [0, b'P', b'I', b'N', b'G', b'F', b'D', b'2'];
 const V2_HEADER_LEN: usize = MAGIC_PREFIX.len() + 8; // magic + fd_count + payload_len
 #[cfg(target_os = "linux")]
 const MAX_FDS: usize = 32;
+// Bound a peer's advertised transfer while allowing large listener sets.
+#[cfg(target_os = "linux")]
+const MAX_TRANSFER_FDS: usize = 64 * 1024;
 
 impl Fds {
     pub fn new() -> Self {
@@ -138,6 +140,20 @@ fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
 }
 
 #[cfg(target_os = "linux")]
+struct SocketPathCleanup<'a, P: ?Sized + NixPath>(&'a P);
+
+#[cfg(target_os = "linux")]
+impl<P: ?Sized + NixPath> Drop for SocketPathCleanup<'_, P> {
+    fn drop(&mut self) {
+        if let Err(error) = nix::unistd::unlink(self.0) {
+            if error != Errno::ENOENT {
+                warn!("Failed to remove transfer socket path: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn get_fds_from<P>(
     path: &P,
     payload: &mut [u8],
@@ -153,9 +169,8 @@ where
         SockType::Stream,
         SockFlag::SOCK_NONBLOCK,
         None,
-    )
-    .unwrap();
-    let unix_addr = UnixAddr::new(path).unwrap();
+    )?;
+    let unix_addr = UnixAddr::new(path)?;
     // clean up old sock
     match nix::unistd::unlink(path) {
         Ok(()) => {
@@ -167,7 +182,8 @@ where
             // TODO: warn if exist but not able to unlink
         }
     };
-    socket::bind(listen_fd.as_raw_fd(), &unix_addr).unwrap();
+    socket::bind(listen_fd.as_raw_fd(), &unix_addr)?;
+    let _path_cleanup = SocketPathCleanup(path);
 
     /* sock is created before we change user, need to give permission */
     stat::fchmodat(
@@ -178,23 +194,17 @@ where
         path,
         stat::Mode::from_bits_truncate(0o666),
         stat::FchmodatFlags::FollowSymlink,
-    )
-    .unwrap();
+    )?;
 
     socket::listen(
         &listen_fd,
         Backlog::new(8).expect("8 is well within SOMAXCONN"),
-    )
-    .unwrap();
+    )?;
 
     let fd = match accept_with_retry_timeout(listen_fd.as_raw_fd(), max_retry) {
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
-            //cleanup
-            if nix::unistd::close(listen_fd).is_ok() {
-                nix::unistd::unlink(path).unwrap();
-            }
             return Err(e);
         }
     };
@@ -239,11 +249,6 @@ where
         receive_v1(fd, payload)?
     };
 
-    //cleanup
-    if nix::unistd::close(listen_fd).is_ok() {
-        nix::unistd::unlink(path).unwrap();
-    }
-
     Ok((fds, bytes))
 }
 
@@ -273,7 +278,7 @@ const MAX_NONBLOCKING_POLLS: usize = 20;
 fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Error> {
     let mut retried = 0;
     loop {
-        match socket::accept(listen_fd) {
+        match socket::accept4(listen_fd, SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC) {
             Ok(fd) => return Ok(fd),
             Err(e) => {
                 if retried > max_retry {
@@ -298,27 +303,106 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
 }
 
 #[cfg(target_os = "linux")]
-fn receive_v1(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error> {
-    let mut io_vec = [IoSliceMut::new(payload); 1];
-    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
-    let msg: RecvMsg<UnixAddr> = socket::recvmsg(
-        fd,
-        &mut io_vec,
-        Some(&mut cmsg_buf),
-        MsgFlags::MSG_CMSG_CLOEXEC,
-    )
-    .unwrap();
+fn receive_fd_message(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<OwnedFd>, usize), Error> {
+    // cmsghdr elements provide the alignment required for ancillary headers. The
+    // syscall sees only control_len bytes, including the SCM_RIGHTS padding.
+    // SAFETY: the argument is a fixed, bounded SCM_RIGHTS payload length.
+    let control_len =
+        unsafe { libc::CMSG_SPACE((MAX_FDS * std::mem::size_of::<RawFd>()) as u32) } as usize;
+    let mut control = Vec::<std::mem::MaybeUninit<libc::cmsghdr>>::new();
+    control.resize_with(
+        control_len.div_ceil(std::mem::size_of::<libc::cmsghdr>()),
+        std::mem::MaybeUninit::zeroed,
+    );
+    let mut io = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
 
-    let mut fds: Vec<RawFd> = Vec::new();
-    for cmsg in msg.cmsgs()? {
-        if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
-            fds.append(&mut vec_fds)
-        } else {
-            warn!("Unexpected control messages: {cmsg:?}")
+    loop {
+        // SAFETY: zero is valid for msghdr. All writable pointers below refer to
+        // live, exclusively borrowed buffers for the duration of recvmsg.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut io;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_len;
+        // SAFETY: iovec and aligned control storage stay live and exclusively
+        // borrowed throughout the syscall; their sizes are initialized above.
+        let bytes = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if bytes < 0 {
+            let error = Errno::last();
+            if error == Errno::EINTR {
+                continue;
+            }
+            return Err(error);
         }
-    }
 
-    Ok((fds, msg.bytes))
+        let mut fds = Vec::new();
+        let used = message.msg_controllen.min(control_len);
+        let base = control.as_ptr().cast::<u8>();
+        // SAFETY: CMSG_LEN only computes the header size for zero data bytes.
+        let header_len = unsafe { libc::CMSG_LEN(0) } as usize;
+        let mut offset = 0;
+        while used - offset >= std::mem::size_of::<libc::cmsghdr>() {
+            // SAFETY: the complete header is within the returned control buffer.
+            // Read unaligned without assuming alignment from a previous
+            // control message's length.
+            let header = unsafe { base.add(offset).cast::<libc::cmsghdr>().read_unaligned() };
+            if header.cmsg_len < header_len {
+                return Err(EIO);
+            }
+            let present = header.cmsg_len.min(used - offset);
+            if present < header_len {
+                return Err(EIO);
+            }
+            let is_rights =
+                header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS;
+            if is_rights {
+                // Own every descriptor the kernel delivered before examining
+                // MSG_CTRUNC or other errors. nix::RecvMsg::cmsgs rejects a
+                // truncated control buffer before exposing those descriptors.
+                for index in 0..(present - header_len) / std::mem::size_of::<RawFd>() {
+                    // SAFETY: each complete c_int is inside this bounded message.
+                    let received = unsafe {
+                        base.add(offset + header_len + index * std::mem::size_of::<RawFd>())
+                            .cast::<RawFd>()
+                            .read_unaligned()
+                    };
+                    if received < 0 {
+                        return Err(EIO);
+                    }
+                    // SAFETY: SCM_RIGHTS returns newly installed descriptors;
+                    // ownership is transferred here exactly once.
+                    fds.push(unsafe { OwnedFd::from_raw_fd(received) });
+                }
+            }
+            if header.cmsg_len > used - offset
+                || (is_rights && (header.cmsg_len - header_len) % std::mem::size_of::<RawFd>() != 0)
+            {
+                return Err(EIO);
+            }
+            // The message length is bounded by control_len, so this conversion
+            // and CMSG_SPACE's padding calculation cannot overflow.
+            let next = unsafe { libc::CMSG_SPACE((header.cmsg_len - header_len) as u32) } as usize;
+            if next > used - offset {
+                break;
+            }
+            offset += next;
+        }
+        if message.msg_controllen > control_len
+            || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+        {
+            return Err(EIO);
+        }
+        return Ok((fds, bytes as usize));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn receive_v1(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error> {
+    let (fds, bytes) = receive_fd_message(fd, payload)?;
+    Ok((fds.into_iter().map(IntoRawFd::into_raw_fd).collect(), bytes))
 }
 
 #[cfg(target_os = "linux")]
@@ -356,45 +440,28 @@ fn receive_v2(
     if header[..magic.len()] != *magic {
         return Err(Error::EINVAL);
     }
-
     let fd_count =
         u32::from_be_bytes(header[magic.len()..magic.len() + 4].try_into().unwrap()) as usize;
     let payload_len =
         u32::from_be_bytes(header[magic.len() + 4..magic.len() + 8].try_into().unwrap()) as usize;
-
-    if payload_len > payload.len() {
+    if payload_len > payload.len() || fd_count > MAX_TRANSFER_FDS {
         return Err(Error::EINVAL);
     }
-
     read_exact_retry(fd, &mut payload[..payload_len])?;
 
-    let mut fds: Vec<RawFd> = Vec::with_capacity(fd_count);
+    // Grow only as descriptors arrive, rather than trusting the peer's count.
+    let mut fds = Vec::new();
     let mut nonblocking_polls = 0;
-
     while fds.len() < fd_count {
         let mut data = [0u8; 1];
-        let mut io_vec = [IoSliceMut::new(&mut data)];
-        let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
-
-        match socket::recvmsg::<UnixAddr>(
-            fd,
-            &mut io_vec,
-            Some(&mut cmsg_buf),
-            MsgFlags::MSG_CMSG_CLOEXEC,
-        ) {
-            Ok(msg) => {
-                if msg.bytes == 0 {
+        match receive_fd_message(fd, &mut data) {
+            Ok((chunk, bytes)) => {
+                if bytes == 0 || chunk.is_empty() {
                     return Err(EIO);
                 }
-                if msg.flags.contains(MsgFlags::MSG_CTRUNC)
-                    || msg.flags.contains(MsgFlags::MSG_TRUNC)
-                {
+                fds.extend(chunk);
+                if fds.len() > fd_count {
                     return Err(EIO);
-                }
-                for cmsg in msg.cmsgs()? {
-                    if let ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
-                        fds.append(&mut vec_fds)
-                    }
                 }
             }
             Err(Errno::EAGAIN) => {
@@ -404,18 +471,13 @@ fn receive_v2(
                 }
                 thread::sleep(NONBLOCKING_POLL_INTERVAL);
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         }
     }
-
-    if fds.len() != fd_count {
-        for fd in fds {
-            let _ = nix::unistd::close(fd);
-        }
-        return Err(EIO);
-    }
-
-    Ok((fds, payload_len))
+    Ok((
+        fds.into_iter().map(IntoRawFd::into_raw_fd).collect(),
+        payload_len,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -638,6 +700,177 @@ mod tests {
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    fn framed_pair(fd_count: usize) -> (OwnedFd, OwnedFd) {
+        let pair = socket::socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        let mut header = Vec::from(MAGIC_PREFIX);
+        header.extend_from_slice(&(fd_count as u32).to_be_bytes());
+        header.extend_from_slice(&0u32.to_be_bytes());
+        write_all_retry(pair.0.as_raw_fd(), &header, 1).unwrap();
+        pair
+    }
+
+    fn failed_v2_transfer(fd_count: usize, delivered: usize) -> OwnedFd {
+        let (sender, receiver) = framed_pair(fd_count);
+        let (read_end, write_end) = nix::unistd::pipe2(fcntl::OFlag::O_NONBLOCK).unwrap();
+        let rights = vec![write_end.as_raw_fd(); delivered];
+        socket::sendmsg::<UnixAddr>(
+            sender.as_raw_fd(),
+            &[IoSlice::new(b"x")],
+            &[ControlMessage::ScmRights(&rights)],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+        drop(write_end);
+        drop(sender);
+        let mut payload = [];
+        assert!(receive_v2(
+            receiver.as_raw_fd(),
+            &mut payload,
+            &MAGIC_PREFIX,
+            V2_HEADER_LEN
+        )
+        .is_err());
+        read_end
+    }
+
+    #[test]
+    fn test_receive_v2_closes_partial_fds_on_eof() {
+        let read_end = failed_v2_transfer(2, 1);
+        let mut byte = [0];
+        // All writers disappear only when every received duplicate is closed.
+        assert_eq!(nix::unistd::read(&read_end, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_receive_v2_closes_fds_on_control_truncation() {
+        let read_end = failed_v2_transfer(MAX_FDS + 1, MAX_FDS + 1);
+        let mut byte = [0];
+        assert_eq!(nix::unistd::read(&read_end, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_receive_v2_closes_fds_on_overdelivery() {
+        let read_end = failed_v2_transfer(1, 2);
+        let mut byte = [0];
+        assert_eq!(nix::unistd::read(&read_end, &mut byte).unwrap(), 0);
+    }
+
+    fn receive_without_peer_eof(
+        fd_count: usize,
+        send_byte: bool,
+    ) -> Result<(Vec<RawFd>, usize), Error> {
+        let (sender, receiver) = framed_pair(fd_count);
+        if send_byte {
+            write_all_retry(sender.as_raw_fd(), b"x", 1).unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = receive_v2(receiver.as_raw_fd(), &mut [], &MAGIC_PREFIX, V2_HEADER_LEN);
+            tx.send(result).unwrap();
+        });
+        let result = rx.recv_timeout(time::Duration::from_secs(2));
+        // Always unblock and join the receiver, even when the assertion will fail.
+        drop(sender);
+        worker.join().unwrap();
+        result.expect("receiver waited for peer EOF instead of rejecting the invalid frame")
+    }
+
+    #[test]
+    fn test_receive_v2_rejects_excessive_count_before_reading_descriptors() {
+        assert_eq!(
+            receive_without_peer_eof(MAX_TRANSFER_FDS + 1, false),
+            Err(Error::EINVAL)
+        );
+    }
+
+    #[test]
+    fn test_receive_v2_rejects_message_without_rights_before_peer_eof() {
+        assert_eq!(receive_without_peer_eof(1, true), Err(EIO));
+    }
+
+    #[test]
+    fn test_receive_v1_closes_fds_on_control_truncation() {
+        let (sender, receiver) = socket::socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        let (read_end, write_end) = nix::unistd::pipe2(fcntl::OFlag::O_NONBLOCK).unwrap();
+        let rights = vec![write_end.as_raw_fd(); MAX_FDS + 1];
+        socket::sendmsg::<UnixAddr>(
+            sender.as_raw_fd(),
+            &[IoSlice::new(b"x")],
+            &[ControlMessage::ScmRights(&rights)],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+        drop(write_end);
+        drop(sender);
+        assert!(receive_v1(receiver.as_raw_fd(), &mut [0; 8]).is_err());
+        assert_eq!(nix::unistd::read(&read_end, &mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_accepted_transfer_socket_is_nonblocking_and_close_on_exec() {
+        let path = format!("/tmp/pingora_accept_flags_{}.sock", std::process::id());
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _path_cleanup = SocketPathCleanup(path.as_str());
+        let sender_path = path.clone();
+        let connector =
+            thread::spawn(move || std::os::unix::net::UnixStream::connect(sender_path).unwrap());
+        let received = accept_with_retry_timeout(listener.as_raw_fd(), 0).unwrap();
+        // SAFETY: accept returned this descriptor and no other owner was created.
+        let received = unsafe { OwnedFd::from_raw_fd(received) };
+        let _sender = connector.join().unwrap();
+        let status = fcntl::fcntl(&received, fcntl::FcntlArg::F_GETFL).unwrap();
+        assert!(fcntl::OFlag::from_bits_truncate(status).contains(fcntl::OFlag::O_NONBLOCK));
+        let descriptor = fcntl::fcntl(&received, fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(fcntl::FdFlag::from_bits_truncate(descriptor).contains(fcntl::FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
+    fn test_get_fds_from_removes_socket_on_receive_failure() {
+        let path = format!("/tmp/pingora_receive_failure_{}.sock", std::process::id());
+        let receive_path = path.clone();
+        let receiver = thread::spawn(move || {
+            let mut payload = [0; 8];
+            get_fds_from(receive_path.as_str(), &mut payload, Some(2))
+        });
+        let mut sender = (0..200)
+            .find_map(|_| match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(stream) => Some(stream),
+                Err(_) => {
+                    thread::sleep(time::Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("receiver did not listen");
+        let mut header = Vec::from(MAGIC_PREFIX);
+        header.extend_from_slice(&0u32.to_be_bytes());
+        // The announced payload exceeds the receiver's buffer.
+        header.extend_from_slice(&9u32.to_be_bytes());
+        sender.write_all(&header).unwrap();
+        drop(sender);
+        let result = receiver.join().unwrap();
+        let path_remained = std::path::Path::new(&path).exists();
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+        assert!(
+            !path_remained,
+            "failed receive left its bound socket behind"
+        );
     }
 
     #[test]
