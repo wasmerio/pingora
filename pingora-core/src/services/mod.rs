@@ -331,6 +331,16 @@ pub trait ServiceWithDependents: Send + Sync {
         None
     }
 
+    /// The name of the runtime group this service runs in.
+    ///
+    /// Services that return the same name share one runtime and its worker threads. Returning
+    /// [`None`] (the default) gives the service a runtime of its own, named after the service.
+    /// [`Server::add_runtime_group`](crate::server::Server::add_runtime_group) describes how a
+    /// group's thread count and runtime options are chosen.
+    fn runtime_group(&self) -> Option<&str> {
+        None
+    }
+
     /// This is currently called to inform the service about the delay it
     /// experienced from between waiting on its dependencies. Default behavior
     /// is to log the time.
@@ -345,6 +355,11 @@ pub trait ServiceWithDependents: Send + Sync {
             self.name(),
             time_waited.as_millis()
         );
+    }
+
+    /// See [`Service::listen_addresses`].
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        None
     }
 }
 
@@ -385,8 +400,16 @@ where
         S::runtime_opts_override(self, global)
     }
 
+    fn runtime_group(&self) -> Option<&str> {
+        S::runtime_group(self)
+    }
+
     fn on_startup_delay(&self, time_waited: Duration) {
         S::on_startup_delay(self, time_waited)
+    }
+
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        S::listen_addresses(self)
     }
 }
 
@@ -435,6 +458,11 @@ pub trait Service: Sync + Send {
         None
     }
 
+    /// See [`ServiceWithDependents::runtime_group`].
+    fn runtime_group(&self) -> Option<&str> {
+        None
+    }
+
     /// This is currently called to inform the service about the delay it
     /// experienced from between waiting on its dependencies. Default behavior
     /// is to log the time.
@@ -449,6 +477,14 @@ pub trait Service: Sync + Send {
             self.name(),
             time_waited.as_millis()
         );
+    }
+
+    /// The bind addresses of the listening sockets this service owns.
+    ///
+    /// Addresses must match the keys used for transferred listening fds. Return [`None`] (the
+    /// default) if the service may consume fds without declaring every key; this disables cleanup.
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        None
     }
 }
 
