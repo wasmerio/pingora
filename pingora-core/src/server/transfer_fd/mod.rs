@@ -25,12 +25,12 @@ use nix::sys::stat;
 #[cfg(target_os = "linux")]
 use nix::unistd::{read, write};
 use nix::{errno::Errno::EIO, Error, NixPath};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::{thread, time};
@@ -98,6 +98,29 @@ impl Fds {
         let keys = deserialize_vec_string(&de_buf[..bytes])?;
         self.deserialize(keys, fds);
         Ok(())
+    }
+
+    /// Close and remove inherited listening fds whose bind addresses are absent from `keep`.
+    ///
+    /// An unclaimed `SO_REUSEPORT` socket remains active without an acceptor and can black-hole
+    /// connections. Removing it also prevents it from being transferred to the next process.
+    /// Returns the addresses removed from the table.
+    #[cfg(unix)]
+    pub fn close_unclaimed(&mut self, keep: &HashSet<String>) -> Vec<String> {
+        let mut closed = Vec::new();
+        self.map.retain(|bind, fd| {
+            if keep.contains(bind) {
+                return true;
+            }
+            if let Err(e) = nix::unistd::close(*fd) {
+                log::warn!(
+                    "Failed to close orphaned inherited listening socket fd {fd} ({bind}): {e}"
+                );
+            }
+            closed.push(bind.clone());
+            false
+        });
+        closed
     }
 }
 
@@ -176,6 +199,12 @@ where
         }
     };
 
+    // Own the transfer connection so every exit path closes it, including failures
+    // while receiving either the legacy or framed protocol.
+    // SAFETY: accept returned this descriptor and no other owner was created.
+    let conn = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = conn.as_raw_fd();
+
     // Decide protocol version by peeking at the magic prefix.
     let mut prefix_buf = [0u8; MAGIC_PREFIX.len()];
     let mut peek_polls = 0;
@@ -209,8 +238,6 @@ where
     } else {
         receive_v1(fd, payload)?
     };
-
-    let _ = nix::unistd::close(fd);
 
     //cleanup
     if nix::unistd::close(listen_fd).is_ok() {
@@ -274,8 +301,13 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
 fn receive_v1(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error> {
     let mut io_vec = [IoSliceMut::new(payload); 1];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
-    let msg: RecvMsg<UnixAddr> =
-        socket::recvmsg(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()).unwrap();
+    let msg: RecvMsg<UnixAddr> = socket::recvmsg(
+        fd,
+        &mut io_vec,
+        Some(&mut cmsg_buf),
+        MsgFlags::MSG_CMSG_CLOEXEC,
+    )
+    .unwrap();
 
     let mut fds: Vec<RawFd> = Vec::new();
     for cmsg in msg.cmsgs()? {
@@ -344,7 +376,12 @@ fn receive_v2(
         let mut io_vec = [IoSliceMut::new(&mut data)];
         let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
 
-        match socket::recvmsg::<UnixAddr>(fd, &mut io_vec, Some(&mut cmsg_buf), MsgFlags::empty()) {
+        match socket::recvmsg::<UnixAddr>(
+            fd,
+            &mut io_vec,
+            Some(&mut cmsg_buf),
+            MsgFlags::MSG_CMSG_CLOEXEC,
+        ) {
             Ok(msg) => {
                 if msg.bytes == 0 {
                     return Err(EIO);
@@ -597,6 +634,7 @@ mod tests {
 
     use super::*;
     use log::{debug, error};
+    use nix::fcntl;
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -674,6 +712,90 @@ mod tests {
                 panic!()
             }
         }
+
+        child.join().unwrap();
+    }
+
+    /// How many fds in this process refer to a unix socket bound to `path`.
+    ///
+    /// Reads the socket inodes bound to `path` from /proc/net/unix, then scans
+    /// /proc/self/fd for descriptors pointing at them. Filtering by path keeps this
+    /// unaffected by unrelated descriptors opened by tests running in parallel.
+    fn unix_socket_fds_bound_to(path: &str) -> usize {
+        let unix = std::fs::read_to_string("/proc/net/unix").unwrap();
+        let inodes: HashSet<&str> = unix
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.split_whitespace();
+                let inode = cols.nth(6)?;
+                (cols.next() == Some(path)).then_some(inode)
+            })
+            .collect();
+        if inodes.is_empty() {
+            return 0;
+        }
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| {
+                target
+                    .to_str()
+                    .and_then(|t| t.strip_prefix("socket:["))
+                    .and_then(|t| t.strip_suffix(']'))
+                    .is_some_and(|inode| inodes.contains(inode))
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_receive_does_not_leak_fds() {
+        init_log();
+        const SOCK: &str = "/tmp/pingora_fds_receive3.sock";
+
+        let dumb_fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+
+        // receiver need to start in another thread since it is blocking
+        let child = thread::spawn(move || {
+            let mut buf: [u8; 32] = [0; 32];
+            let (fds, _) = get_fds_from(SOCK, &mut buf, None).unwrap();
+            assert_eq!(1, fds.len());
+
+            // The received listener is kept for the lifetime of the process, so it must
+            // not be inherited by unrelated children across exec().
+            let flags = fcntl::fcntl(
+                // SAFETY: the fd was just received and stays open for this call.
+                unsafe { BorrowedFd::borrow_raw(fds[0]) },
+                fcntl::FcntlArg::F_GETFD,
+            )
+            .unwrap();
+            assert!(
+                fcntl::FdFlag::from_bits_truncate(flags).contains(fcntl::FdFlag::FD_CLOEXEC),
+                "fd received over SCM_RIGHTS is missing FD_CLOEXEC"
+            );
+
+            // The accepted connection is only needed during the transfer itself.
+            assert_eq!(
+                0,
+                unix_socket_fds_bound_to(SOCK),
+                "the accepted transfer socket was left open"
+            );
+
+            // Don't leak the descriptors this test just received.
+            for fd in fds {
+                // SAFETY: received over SCM_RIGHTS just above and not owned anywhere else.
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        });
+
+        let fds = vec![dumb_fd.as_raw_fd()];
+        let buf: [u8; 32] = [1; 32];
+        send_fds_to(fds, &buf, SOCK, None).unwrap();
 
         child.join().unwrap();
     }
@@ -767,6 +889,18 @@ mod tests {
             assert_eq!(payload.len(), bytes);
             assert_eq!(9, buf[0]);
             assert_eq!(9, buf[payload.len() - 1]);
+            assert_eq!(
+                0,
+                unix_socket_fds_bound_to("/tmp/pingora_fds_receive_v2.sock")
+            );
+            for fd in recv_fds {
+                // SAFETY: each descriptor was received above and has no other owner.
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                let flags = fcntl::fcntl(&fd, fcntl::FcntlArg::F_GETFD).unwrap();
+                assert!(
+                    fcntl::FdFlag::from_bits_truncate(flags).contains(fcntl::FdFlag::FD_CLOEXEC)
+                );
+            }
         });
 
         send_fds_to(fds, &payload, "/tmp/pingora_fds_receive_v2.sock", None).unwrap();
@@ -871,5 +1005,78 @@ mod tests {
 
         nix::unistd::close(send_fd).unwrap();
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod close_unclaimed_tests {
+    use super::Fds;
+    use std::collections::HashSet;
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    // Closure is observed by reading the other end of a socket pair, which
+    // reports end-of-file exactly when its peer is gone. Checking the descriptor
+    // *number* would be racy: numbers are process-wide and reassigned
+    // lowest-free-first, so a concurrent test in this binary can be handed the
+    // number just closed and make it valid again first. Observing ends are
+    // non-blocking, so a descriptor that wrongly stayed open fails an assertion
+    // rather than hanging.
+    //
+    // A second owning handle would turn a wrongly closed descriptor into an I/O
+    // safety abort of the whole binary, so `Fds` gets raw numbers.
+
+    #[test]
+    fn closes_only_unclaimed_fds() {
+        let (mut keep_peer, keep_local) = UnixStream::pair().unwrap();
+        let (mut drop_peer, drop_local) = UnixStream::pair().unwrap();
+        keep_peer.set_nonblocking(true).unwrap();
+        drop_peer.set_nonblocking(true).unwrap();
+        let keep_fd = keep_local.into_raw_fd();
+
+        let mut fds = Fds::new();
+        fds.add("127.0.0.1:80".to_string(), keep_fd);
+        fds.add("127.0.0.1:9090".to_string(), drop_local.into_raw_fd());
+
+        let keep: HashSet<String> = ["127.0.0.1:80".to_string()].into_iter().collect();
+        let closed = fds.close_unclaimed(&keep);
+
+        assert_eq!(closed, vec!["127.0.0.1:9090".to_string()]);
+        assert_eq!(*fds.get("127.0.0.1:80").unwrap(), keep_fd);
+        assert!(fds.get("127.0.0.1:9090").is_none());
+
+        // Dropping the map entry is not enough: the descriptor itself has to be
+        // closed, which is the leak this function exists to prevent.
+        assert!(
+            matches!(drop_peer.read(&mut [0u8; 1]), Ok(0)),
+            "the unclaimed descriptor was not closed"
+        );
+        assert!(
+            matches!(keep_peer.read(&mut [0u8; 1]), Err(e) if e.kind() == ErrorKind::WouldBlock),
+            "the claimed descriptor was closed"
+        );
+
+        // `Fds` does not close on drop.
+        // SAFETY: asserted open just above, and no other owner remains.
+        drop(unsafe { OwnedFd::from_raw_fd(keep_fd) });
+    }
+
+    #[test]
+    fn empty_keep_set_closes_everything() {
+        let (mut peer, local) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+
+        let mut fds = Fds::new();
+        fds.add("127.0.0.1:9090".to_string(), local.into_raw_fd());
+
+        let closed = fds.close_unclaimed(&HashSet::new());
+
+        assert_eq!(closed, vec!["127.0.0.1:9090".to_string()]);
+        assert!(fds.is_empty());
+        assert!(
+            matches!(peer.read(&mut [0u8; 1]), Ok(0)),
+            "the unclaimed descriptor was not closed"
+        );
     }
 }
