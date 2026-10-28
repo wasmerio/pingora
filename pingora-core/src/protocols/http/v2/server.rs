@@ -50,9 +50,9 @@ const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
 
 /// A structured cause indicating that the downstream client reset an HTTP/2 stream.
 ///
-/// Errors returned by [`HttpSession::read_body_or_idle`] use this as their root cause when
-/// `h2` reports a reset reason. [`Self::find`] retrieves it through Pingora error-context
-/// wrapping without relying on formatted error messages.
+/// Errors returned while reading a request body or idling use this as their root cause when
+/// `h2` reports an HTTP/2 stream reset sent by the downstream peer. [`Self::find`] retrieves it
+/// through Pingora error-context wrapping without relying on formatted error messages.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DownstreamH2Reset {
     reason: h2::Reason,
@@ -77,6 +77,27 @@ impl fmt::Display for DownstreamH2Reset {
 }
 
 impl std::error::Error for DownstreamH2Reset {}
+
+fn downstream_request_body_read_error(error: h2::Error) -> crate::BError {
+    let reset = if error.is_reset() && error.is_remote() {
+        error.reason().map(|reason| DownstreamH2Reset { reason })
+    } else {
+        None
+    };
+
+    match reset {
+        Some(reset) => Error::because(
+            ErrorType::ReadError,
+            "while reading downstream request body",
+            reset,
+        ),
+        None => Error::because(
+            ErrorType::ReadError,
+            "while reading downstream request body",
+            error,
+        ),
+    }
+}
 
 /// Build [`H2Options`] with bounded defaults for received requests.
 ///
@@ -292,10 +313,12 @@ impl HttpSession {
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
-            ErrorType::ReadError,
-            "while reading downstream request body",
-        )?;
+        let data = self
+            .request_body_reader
+            .data()
+            .await
+            .transpose()
+            .map_err(downstream_request_body_read_error)?;
         if let Some(data) = data.as_ref() {
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
@@ -873,6 +896,48 @@ mod test {
                 DownstreamH2Reset::find(&error).map(|reset| reset.reason()),
                 Some(reason)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_reset_reasons_are_structured_read_errors() {
+        for reason in [
+            h2::Reason::CANCEL,
+            h2::Reason::NO_ERROR,
+            h2::Reason::REFUSED_STREAM,
+        ] {
+            let (mut session, mut peer) = test_session().await;
+            peer.request_body.take().unwrap().send_reset(reason);
+
+            let error = tokio::time::timeout(Duration::from_secs(1), session.read_body_bytes())
+                .await
+                .expect("server did not observe the request-body reset")
+                .unwrap_err()
+                .more_context("outer application context");
+
+            assert_eq!(error.etype(), &ErrorType::ReadError);
+            assert_eq!(
+                DownstreamH2Reset::find(&error).map(|reset| reset.reason()),
+                Some(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn non_reset_h2_errors_are_not_structured_as_downstream_resets() {
+        for reason in [
+            h2::Reason::CANCEL,
+            h2::Reason::NO_ERROR,
+            h2::Reason::PROTOCOL_ERROR,
+        ] {
+            // A bare `Reason` is an h2 protocol error, not an RST_STREAM received
+            // from the peer. Its reason alone must therefore never be sufficient.
+            let error = downstream_request_body_read_error(h2::Error::from(reason))
+                .more_context("outer application context");
+
+            assert_eq!(error.etype(), &ErrorType::ReadError);
+            assert!(DownstreamH2Reset::find(&error).is_none());
+            assert!(error.root_cause().downcast_ref::<h2::Error>().is_some());
         }
     }
 
