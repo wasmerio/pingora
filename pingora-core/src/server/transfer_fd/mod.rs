@@ -326,7 +326,7 @@ fn receive_fd_message(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<OwnedFd>, us
         message.msg_iov = &mut io;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control_len;
+        message.msg_controllen = control_len as _;
         // SAFETY: iovec and aligned control storage stay live and exclusively
         // borrowed throughout the syscall; their sizes are initialized above.
         let bytes = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
@@ -339,7 +339,10 @@ fn receive_fd_message(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<OwnedFd>, us
         }
 
         let mut fds = Vec::new();
-        let used = message.msg_controllen.min(control_len);
+        // musl uses socklen_t here; glibc uses size_t.
+        #[allow(clippy::unnecessary_cast)]
+        let returned_control_len = message.msg_controllen as usize;
+        let used = returned_control_len.min(control_len);
         let base = control.as_ptr().cast::<u8>();
         // SAFETY: CMSG_LEN only computes the header size for zero data bytes.
         let header_len = unsafe { libc::CMSG_LEN(0) } as usize;
@@ -349,10 +352,13 @@ fn receive_fd_message(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<OwnedFd>, us
             // Read unaligned without assuming alignment from a previous
             // control message's length.
             let header = unsafe { base.add(offset).cast::<libc::cmsghdr>().read_unaligned() };
-            if header.cmsg_len < header_len {
+            // musl's field is narrower than glibc's on 64-bit Linux.
+            #[allow(clippy::unnecessary_cast)]
+            let message_len = header.cmsg_len as usize;
+            if message_len < header_len {
                 return Err(EIO);
             }
-            let present = header.cmsg_len.min(used - offset);
+            let present = message_len.min(used - offset);
             if present < header_len {
                 return Err(EIO);
             }
@@ -377,20 +383,20 @@ fn receive_fd_message(fd: RawFd, payload: &mut [u8]) -> Result<(Vec<OwnedFd>, us
                     fds.push(unsafe { OwnedFd::from_raw_fd(received) });
                 }
             }
-            if header.cmsg_len > used - offset
-                || (is_rights && (header.cmsg_len - header_len) % std::mem::size_of::<RawFd>() != 0)
+            if message_len > used - offset
+                || (is_rights && (message_len - header_len) % std::mem::size_of::<RawFd>() != 0)
             {
                 return Err(EIO);
             }
             // The message length is bounded by control_len, so this conversion
             // and CMSG_SPACE's padding calculation cannot overflow.
-            let next = unsafe { libc::CMSG_SPACE((header.cmsg_len - header_len) as u32) } as usize;
+            let next = unsafe { libc::CMSG_SPACE((message_len - header_len) as u32) } as usize;
             if next > used - offset {
                 break;
             }
             offset += next;
         }
-        if message.msg_controllen > control_len
+        if returned_control_len > control_len
             || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
         {
             return Err(EIO);
@@ -460,6 +466,7 @@ fn receive_v2(
                     return Err(EIO);
                 }
                 fds.extend(chunk);
+                nonblocking_polls = 0;
                 if fds.len() > fd_count {
                     return Err(EIO);
                 }
